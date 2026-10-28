@@ -40,6 +40,11 @@ PRESET_NAMES = {"ultra": "Ultra", "equilibrado": "Equilibrada", "economico": "Ec
 MODEL_NAMES = {"classico": "nenhum (filtros clássicos)", "realesr_general_x4v3": "Leve"}
 
 
+def num(x: float, digits: int = 1) -> str:
+    """Número com vírgula decimal (pt-BR)."""
+    return f"{x:.{digits}f}".replace(".", ",")
+
+
 def fmt_duration(seconds: float | None) -> str:
     if seconds is None:
         return "—"
@@ -447,7 +452,7 @@ class MainWindow(QMainWindow):
             return
         backend = BACKEND_NAMES.get(plan.backend.value, plan.backend.value)
         gpu = plan.gpu_name or "CPU"
-        self.hw_chip.setText(f"{gpu}  ·  {backend}")
+        self.hw_chip.setText(f"{gpu}  ·  {backend}" if plan.gpu_name else "Sem placa de vídeo compatível · CPU")
         self.hw_chip.setToolTip("\n".join(plan.reasons))
         model = self.cb_model.currentData()
         scale = self.cb_scale.currentData()
@@ -463,9 +468,12 @@ class MainWindow(QMainWindow):
                     "Use a prévia para ver a estimativa.")
         elif plan.backend == Backend.NCNN_VULKAN:
             warn = "<br><b>Atenção:</b> esta placa ainda não tem suporte de IA nesta versão; a IA vai rodar na CPU."
+        quality = PRESET_NAMES.get(plan.preset.value, plan.preset.value)
+        if plan.preset == Preset.CPU and model != "auto" and scale > 1:
+            quality = "processamento na CPU"
+        where = f"{gpu} via {backend}" if plan.gpu_name else "o processador (CPU)"
         self.plan_label.setText(
-            f"<b>Vai usar:</b> {gpu} via {backend}<br>"
-            f"Qualidade {PRESET_NAMES.get(plan.preset.value, plan.preset.value)} · modelo {model_txt}{warn}")
+            f"<b>Vai usar:</b> {where}<br>Qualidade {quality} · modelo {model_txt}{warn}")
         self.plan_label.setToolTip("\n".join(plan.reasons))
 
     def _show_hw_details(self):
@@ -673,11 +681,11 @@ class MainWindow(QMainWindow):
                 self.progress.setRange(0, 1000)
                 self.progress.setValue(int(1000 * done / total))
                 pct = 100 * done / total
-                self.progress.setFormat(f"{pct:.1f}%")
+                self.progress.setFormat(f"{num(pct)}%")
                 job.item.setText(3, f"Processando {pct:.0f}%")
             n = self._done_batch + 1
             self.status.setText(
-                f"Processando {n} de {self._total_batch}: {job.path.name}  ·  {ev.get('fps', 0):.1f} quadros/s  ·  "
+                f"Processando {n} de {self._total_batch}: {job.path.name}  ·  {num(ev.get('fps', 0))} quadros/s  ·  "
                 f"faltam ~{fmt_duration(ev.get('eta'))}")
             if self._shot:
                 self._shot.on_progress(done)
@@ -796,7 +804,7 @@ class MainWindow(QMainWindow):
             engine += f" ({r['provider'].replace('ExecutionProvider', '')})"
         parts = [f"Quadro em {fmt_duration(r.get('time'))} · {engine}"]
         if spf:
-            parts.append(f"{spf:.2f} s por quadro · vídeo inteiro: <b>~{fmt_duration(est)}</b> só na IA")
+            parts.append(f"{num(spf, 2)} s por quadro · vídeo inteiro: <b>~{fmt_duration(est)}</b> só na IA")
         dlg = PreviewDialog(r["before"], r["after"], "<br>".join(parts), self)
         dlg.finished.connect(lambda *_: shutil.rmtree(out, ignore_errors=True))
         if self._shot:
@@ -875,8 +883,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         if self._running():
-            r = QMessageBox.question(self, "Sair", "Há um vídeo sendo processado. Cancelar e sair?")
-            if r != QMessageBox.Yes:
+            box = QMessageBox(QMessageBox.Question, "Sair", "Há um vídeo sendo processado. Cancelar e sair?",
+                              QMessageBox.Yes | QMessageBox.No, self)
+            box.button(QMessageBox.Yes).setText("Cancelar e sair")
+            box.button(QMessageBox.No).setText("Continuar processando")
+            box.setDefaultButton(QMessageBox.No)
+            if box.exec() != QMessageBox.Yes:
                 e.ignore()
                 return
             self.proc.kill()
@@ -962,6 +974,11 @@ def run() -> int:
     QApplication.setApplicationName("VideoImprove")
     QApplication.setOrganizationName("VideoImprove")
     app = QApplication(sys.argv)
+    # textos padrão do Qt (botões OK/Cancelar, diálogos de arquivo) em português
+    from PySide6.QtCore import QLibraryInfo, QLocale, QTranslator
+    tr = QTranslator(app)
+    if tr.load(QLocale("pt_BR"), "qtbase", "_", QLibraryInfo.path(QLibraryInfo.TranslationsPath)):
+        app.installTranslator(tr)
     icon = paths.app_dir() / ("icon.ico" if os.name == "nt" else "icon.png")
     for cand in (icon, Path(__file__).resolve().parents[1] / "packaging" / "icon.png"):
         if cand.exists():

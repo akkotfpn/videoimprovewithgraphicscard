@@ -132,6 +132,7 @@ class PreviewDialog(QDialog):
         actual = QCheckBox("Tamanho real (100%)")
         actual.toggled.connect(self._toggle_actual)
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.button(QDialogButtonBox.Close).setText("Fechar")
         buttons.rejected.connect(self.reject)
 
         bottom = QHBoxLayout()

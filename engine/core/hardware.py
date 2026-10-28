@@ -336,6 +336,8 @@ def enumerate_dxgi(include_software: bool = False) -> list[dict]:
 
 def probe_dxgi(gpus: list[GPUInfo]) -> None:
     for a in enumerate_dxgi():
+        if a["vendor_id"] == 0x1414:  # Microsoft (Basic Render Driver / WARP): renderizador por software
+            continue
         vendor = _VENDOR_IDS.get(a["vendor_id"]) or _vendor_from_name(a["name"])
         if vendor == Vendor.CPU:
             continue
