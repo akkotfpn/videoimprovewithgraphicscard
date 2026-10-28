@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import sys
 import urllib.request
 from dataclasses import dataclass
@@ -54,11 +53,8 @@ CATALOG: dict[str, ModelSpec] = {
 
 
 def default_dir() -> Path:
-    env = os.environ.get("VIDEOIMPROVE_MODELS")
-    if env:
-        return Path(env)
-    repo = Path(__file__).resolve().parents[2] / "models"
-    return repo if repo.exists() else Path.home() / ".videoimprove" / "models"
+    from ..core.paths import models_dir
+    return models_dir()
 
 
 def onnx_path(key: str, fp16: bool = False, models_dir: Path | None = None) -> Path:

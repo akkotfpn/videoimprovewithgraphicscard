@@ -348,3 +348,52 @@ def test_ultra_without_realbasicvsr_falls_back_to_x4plus(tmp_path, monkeypatch):
     monkeypatch.setenv("VIDEOIMPROVE_MODELS", str(tmp_path))
     p = choose_plan(_dev_pc(["CUDAExecutionProvider"]))
     assert cli.resolve_model(None, p).name.startswith("realesrgan_x4plus")
+
+
+# ---------------- app: 60 fps por campo, prévia, autoteste ----------------
+@needs_ffmpeg
+def test_field_rate_deinterlace_doubles_with_real_motion(vhs_sample, tmp_path):
+    src_v, _ = _streams(vhs_sample)
+    out = tmp_path / "60p.mkv"
+    Pipeline(PipelineConfig(vhs_sample, out, [ResizeUpscale(2)], batch_size=4, field_rate=True)).run()
+    v, a = _streams(out)
+    from fractions import Fraction
+    assert abs(float(Fraction(v["r_frame_rate"])) - 60000 / 1001) < 0.01
+    assert abs(int(v["nb_read_frames"]) - 2 * int(src_v["nb_read_frames"])) <= 1
+    assert a["codec_name"] == "pcm_s16le"
+
+
+@needs_ffmpeg
+def test_cli_preview_writes_same_size_images(vhs_sample, tmp_path):
+    from PIL import Image
+    from engine import cli
+    assert cli.main(["preview", str(vhs_sample), "--out", str(tmp_path), "--time", "1", "--preset", "cpu"]) == 0
+    a, b = Image.open(tmp_path / "antes.png"), Image.open(tmp_path / "depois.png")
+    assert a.size == b.size == (1440, 960)
+
+
+@needs_ffmpeg
+def test_cli_run_smooth_on_interlaced_uses_field_rate(vhs_sample, tmp_path, capsys):
+    from engine import cli
+    out = tmp_path / "s.mkv"
+    assert cli.main(["run", str(vhs_sample), str(out), "--preset", "cpu", "--smooth", "--json"]) == 0
+    events = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.startswith("{")]
+    start = next(e for e in events if e["event"] == "start")
+    assert start["field_rate"] is True and "blend_x2" not in start["stages"]
+    prog = [e for e in events if e["event"] == "progress"]
+    assert prog[-1]["total"] == 180 and "eta" in prog[-1]
+    assert events[-1]["event"] == "done"
+
+
+def test_denoise_levels_map_to_filters():
+    from engine import cli
+    p = choose_plan(hw(None))
+    assert cli.denoise_filter("off", p) == []
+    assert cli.denoise_filter("strong", p)[0].startswith("nlmeans")
+    assert cli.denoise_filter("auto", p) == ["hqdn3d=3:2:6:4"]
+
+
+def test_plan_device_id_follows_runtime():
+    g = GPUInfo("NVIDIA GeForce RTX 5070", Vendor.NVIDIA, 12227, (12, 0), dxgi_index=1, cuda_index=0)
+    assert choose_plan(hw(g, ["DmlExecutionProvider"])).device_id == 1
+    assert choose_plan(hw(g, ["CUDAExecutionProvider"])).device_id == 0

@@ -62,7 +62,7 @@ class OnnxUpscale:
     fps_factor = 1
 
     def __init__(self, model_path: str | Path, scale: int, backend: Backend, model_scale: int | None = None,
-                 tile: int = 512, overlap: int = 16, device_id: int = 0, cache_dir: str | Path = "cache"):
+                 tile: int = 512, overlap: int = 16, device_id: int = 0, cache_dir: str | Path | None = None):
         """
         scale: fator de saída pedido (2 é o recomendado para VHS).
         model_scale: fator nativo do modelo (o compact x4v3 é 4). Se maior que `scale`,
@@ -71,6 +71,9 @@ class OnnxUpscale:
         self.scale, self.tile, self.overlap = scale, tile, overlap
         self.tile_hw: tuple[int, int] = (tile, tile)
         self._frame_wh: tuple[int, int] | None = None
+        if cache_dir is None:
+            from ..core.paths import cache_dir as _cache
+            cache_dir = _cache() / "tensorrt"
         self.backend, self.device_id, self.cache_dir = backend, device_id, cache_dir
         self.model_path = Path(model_path)
         self._load(self.model_path)
@@ -99,7 +102,7 @@ class OnnxUpscale:
 
     def _load(self, model_path: Path) -> None:
         import onnxruntime as ort
-        if hasattr(ort, "preload_dlls"):
+        if hasattr(ort, "preload_dlls") and self.backend in (Backend.CUDA, Backend.TENSORRT):
             # onnxruntime-gpu[cuda,cudnn] instala CUDA/cuDNN como pacotes pip; isto os carrega
             # sem precisar do CUDA Toolkit instalado no Windows
             try:

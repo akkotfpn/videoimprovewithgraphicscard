@@ -1,0 +1,167 @@
+name: App Windows
+
+# Gera o app portátil (pasta com VideoImprove.exe) em duas variantes e publica os .zip numa Release.
+# - push na main / execução manual: atualiza a pré-release "dev"
+# - tag v*: cria a release da versão
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: app-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REL: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'dev' }}
+
+jobs:
+  release:
+    name: Preparar release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Criar/atualizar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ "$REL" = "dev" ]; then
+            gh release delete dev --cleanup-tag -y || true
+            gh release create dev --prerelease --target "$GITHUB_SHA" \
+              --title "Versão de desenvolvimento (main)" \
+              --notes "Build automático do último commit da main ($GITHUB_SHA). Baixe o zip **Universal** (qualquer placa de vídeo) ou **NVIDIA** (RTX/GTX 16), extraia e abra o VideoImprove.exe."
+          else
+            gh release view "$REL" >/dev/null 2>&1 || gh release create "$REL" --title "VideoImprove $REL" \
+              --notes "Baixe o zip **Universal** (qualquer placa de vídeo) ou **NVIDIA** (RTX/GTX 16), extraia e abra o VideoImprove.exe."
+          fi
+
+  build:
+    name: Build ${{ matrix.flavor }}
+    needs: release
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [universal, nvidia]
+    env:
+      VIDEOIMPROVE_FLAVOR: ${{ matrix.flavor }}
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Dependências
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          if [ "$VIDEOIMPROVE_FLAVOR" = "nvidia" ]; then EXTRA=nvidia; else EXTRA=directml; fi
+          pip install ".[${EXTRA},dev]" "pyinstaller>=6.10" "pyside6-essentials>=6.8"
+          pip list
+
+      - name: FFmpeg
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python packaging/fetch_ffmpeg.py build/ffmpeg
+
+      - name: Modelos (Real-ESRGAN -> ONNX, sem PyTorch)
+        env:
+          VIDEOIMPROVE_MODELS: build/models
+        run: python -m engine models install all
+
+      - name: Testes da engine no Windows
+        if: matrix.flavor == 'universal'
+        shell: bash
+        run: |
+          export PATH="$PWD/build/ffmpeg:$PATH"
+          mkdir -p models/_weights && cp build/models/_weights/*.pth models/_weights/
+          python -m pytest -q
+
+      - name: PyInstaller
+        run: pyinstaller packaging/videoimprove.spec --noconfirm --clean
+
+      - name: Montar a pasta do app
+        shell: bash
+        run: |
+          D=dist/VideoImprove
+          mkdir -p "$D/bin" "$D/models" "$D/licenses"
+          cp build/ffmpeg/*.exe build/ffmpeg/*.dll "$D/bin/"
+          cp build/models/*.onnx "$D/models/"
+          cp packaging/icon.ico packaging/LEIA-ME.txt "$D/"
+          python packaging/collect_licenses.py "$D/licenses" build/ffmpeg
+          du -sh "$D" "$D/_internal" "$D/bin" "$D/models"
+
+      - name: Autoteste do app empacotado
+        shell: bash
+        run: |
+          D=dist/VideoImprove
+          "$D/videoimprove-cli.exe" detect
+          "$D/videoimprove-cli.exe" selftest
+          python -c "from engine.core.hardware import enumerate_dxgi; print('DXGI:', enumerate_dxgi(include_software=True))"
+
+      - name: Conferir DLLs NVIDIA
+        if: matrix.flavor == 'nvidia'
+        shell: bash
+        run: |
+          cd dist/VideoImprove/_internal
+          find . -iname "cudart64*.dll" -o -iname "cublas64*.dll" -o -iname "cudnn64*.dll" \
+                 -o -iname "onnxruntime_providers_cuda.dll" | sort
+          for p in "cudart64*.dll" "cublas64*.dll" "cudnn64*.dll" "onnxruntime_providers_cuda.dll"; do
+            [ -n "$(find . -iname "$p" | head -1)" ] || { echo "faltando: $p"; exit 1; }
+          done
+
+      - name: Rodar a interface e tirar prints
+        shell: pwsh
+        timeout-minutes: 25
+        run: |
+          $shots = Join-Path $PWD "prints-${{ matrix.flavor }}"
+          $video = Join-Path $PWD "build\amostra.mkv"
+          & build\ffmpeg\ffmpeg.exe -v error -y -f lavfi -i "testsrc2=size=360x240:rate=30000/1001:duration=1.5" `
+              -f lavfi -i "sine=frequency=440:duration=1.5:sample_rate=48000" `
+              -vf "noise=alls=18:allf=t,tinterlace=mode=interleave_top,fps=30000/1001,setfield=tff" `
+              -c:v libx264 -flags +ildct+ilme -c:a pcm_s16le -shortest $video
+          $env:VIDEOIMPROVE_SCREENSHOT_DIR = $shots
+          $env:VIDEOIMPROVE_SCREENSHOT_VIDEO = $video
+          $p = Start-Process -FilePath "dist\VideoImprove\VideoImprove.exe" -PassThru -Wait
+          Write-Host "código de saída da interface: $($p.ExitCode)"
+          if (Test-Path "$shots\resultado.json") { Get-Content "$shots\resultado.json" }
+          Get-ChildItem $shots
+          if ($p.ExitCode -ne 0) { exit 1 }
+          Remove-Item -Recurse -Force "dist\VideoImprove\data" -ErrorAction SilentlyContinue
+
+      - name: Guardar prints
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prints-${{ matrix.flavor }}
+          path: prints-${{ matrix.flavor }}
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Compactar
+        shell: pwsh
+        run: |
+          $name = "VideoImprove-${{ matrix.flavor }}-win64.zip"
+          if ("${{ matrix.flavor }}" -eq "universal") { $name = "VideoImprove-Universal-win64.zip" }
+          else { $name = "VideoImprove-NVIDIA-win64.zip" }
+          Push-Location dist
+          7z a -tzip -mx=5 "..\$name" VideoImprove | Out-Null
+          Pop-Location
+          $mb = [math]::Round((Get-Item $name).Length / 1MB)
+          Write-Host "$name : $mb MB"
+          if ($mb -gt 1990) { Write-Error "zip maior que o limite de 2 GB da Release"; exit 1 }
+          "ZIP=$name" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Publicar na release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$REL" "$ZIP" --clobber

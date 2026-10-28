@@ -1,0 +1,35 @@
+VideoImprove: restauração de vídeos antigos com IA
+===================================================
+
+COMO USAR
+1. Extraia esta pasta inteira para onde quiser (Documentos, área de trabalho, pendrive...).
+   Não precisa instalar nada.
+2. Abra o VideoImprove.exe.
+3. Arraste os vídeos para a janela (ou clique em "Adicionar vídeos").
+4. Opcional: selecione um vídeo e clique em "Ver prévia de um quadro" para comparar
+   antes e depois e ver quanto tempo vai levar.
+5. Clique em "Restaurar". O resultado sai como <nome>_restaurado.mkv, com o áudio original.
+
+Na primeira vez, o Windows pode mostrar "O Windows protegeu o computador", porque o programa
+não tem assinatura digital paga. Clique em "Mais informações" e depois em "Executar assim mesmo".
+
+QUAL VERSÃO BAIXAR
+- Universal: qualquer placa de vídeo com DirectX 12. Vale para vídeo integrado Intel ou AMD,
+  GTX 1650/1660, Radeon RX, Intel Arc e também placas NVIDIA RTX.
+- NVIDIA: placas NVIDIA RTX ou GTX 16. Mais rápida nelas, mas o download é bem maior.
+  Precisa de driver NVIDIA recente (580 ou mais novo).
+
+DICAS PARA FITAS VHS
+- "2×" de ampliação costuma ficar mais natural que "4×": a fita tem pouca resolução real.
+- "Movimento fluido (60 fps)" aproveita os dois campos de cada quadro da fita: o movimento fica
+  como na TV da época, sem inventar quadros.
+- A estimativa de tempo aparece na prévia. Em PCs com vídeo integrado, deixar rodando durante
+  a noite é normal.
+
+PASTAS
+- bin\       FFmpeg (leitura e gravação de vídeo)
+- models\    modelos de IA (Real-ESRGAN)
+- data\      configurações e arquivos temporários (criada no primeiro uso)
+- licenses\  licenças de todos os componentes
+
+Código-fonte: https://github.com/akkotfpn/videoimprovewithgraphicscard

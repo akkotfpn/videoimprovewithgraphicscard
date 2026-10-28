@@ -27,6 +27,8 @@ from typing import Callable, Protocol
 
 import numpy as np
 
+from .paths import no_window_flags
+
 log = logging.getLogger("restaura.pipeline")
 _SENTINEL = object()
 
@@ -49,7 +51,8 @@ class VideoInfo:
 def probe(path: str | Path) -> VideoInfo:
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_format", str(path)],
-        capture_output=True, text=True, check=True).stdout
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
+        creationflags=no_window_flags()).stdout
     data = json.loads(out)
     v = next(s for s in data["streams"] if s["codec_type"] == "video")
     fps = Fraction(v.get("avg_frame_rate") or v["r_frame_rate"])
@@ -94,6 +97,7 @@ class PipelineConfig:
     stages: list[Stage]
     batch_size: int = 4
     deinterlace: bool | None = None       # None = automático pelo ffprobe
+    field_rate: bool = False              # desentrelaçar em 1 quadro por campo (29,97i -> 59,94p)
     pre_filters: list[str] = field(default_factory=list)  # filtros clássicos FFmpeg antes da IA
     crf: int = 18
     encoder: str = "libx264"              # h264_nvenc / hevc_nvenc / hevc_amf / hevc_qsv
@@ -109,12 +113,20 @@ class Pipeline:
         self._stop = threading.Event()
 
     # ---- montagem dos comandos ffmpeg ----
+    @property
+    def deinterlacing(self) -> bool:
+        return self.cfg.deinterlace if self.cfg.deinterlace is not None else self.info.interlaced
+
+    @property
+    def field_rate_active(self) -> bool:
+        return self.deinterlacing and self.cfg.field_rate
+
     def _decoder_cmd(self) -> list[str]:
         filters = []
-        deint = self.cfg.deinterlace if self.cfg.deinterlace is not None else self.info.interlaced
-        if deint:
-            # bwdif mode=0: 1 frame por frame (mantém fps e sincronia com o áudio)
-            filters.append("bwdif=mode=0")
+        if self.deinterlacing:
+            # bwdif mode=0: 1 quadro por quadro. mode=1: 1 quadro por campo (dobra o fps com
+            # movimento real, o jeito mais fiel de converter VHS). Ambos mantêm a sincronia do áudio.
+            filters.append("bwdif=mode=1" if self.cfg.field_rate else "bwdif=mode=0")
         filters += self.cfg.pre_filters
         cmd = ["ffmpeg", "-v", "error", "-nostdin", "-i", str(self.cfg.input)]
         if filters:
@@ -194,13 +206,16 @@ class Pipeline:
             out_w, out_h = out_w * st.scale, out_h * st.scale
             fps_mult *= st.fps_factor
         out_w -= out_w % 2; out_h -= out_h % 2  # yuv420p exige par
-        out_fps = info.fps * fps_mult
+        in_fps = info.fps * (2 if self.field_rate_active else 1)
+        total_in = info.frames * (2 if self.field_rate_active else 1)
+        out_fps = in_fps * fps_mult
         log.info("entrada %dx%d @ %s fps (%d frames, entrelaçado=%s) -> saída %dx%d @ %s",
                  w, h, float(info.fps), info.frames, info.interlaced, out_w, out_h, float(out_fps))
 
-        dec = subprocess.Popen(self._decoder_cmd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        dec = subprocess.Popen(self._decoder_cmd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               creationflags=no_window_flags())
         enc = subprocess.Popen(self._encoder_cmd(out_w, out_h, out_fps),
-                               stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                               stdin=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=no_window_flags())
         q_in: queue.Queue = queue.Queue(self.cfg.queue_depth)
         q_out: queue.Queue = queue.Queue(self.cfg.queue_depth)
         t_r = threading.Thread(target=self._reader, args=(dec, q_in, w, h), daemon=True)
@@ -219,7 +234,7 @@ class Pipeline:
                 q_out.put(batch[:, :out_h, :out_w])
                 done += n_in
                 if self.cfg.progress:
-                    self.cfg.progress(done, info.frames, done / (time.perf_counter() - t0))
+                    self.cfg.progress(done, total_in, done / (time.perf_counter() - t0))
             # estágios temporais (ex.: RIFE) podem reter o último frame
             # o que sai do flush do estágio i ainda passa pelos estágios i+1..n
             tail = None

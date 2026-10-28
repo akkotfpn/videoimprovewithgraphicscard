@@ -17,3 +17,6 @@ cache/
 *.mkv
 *.avi
 models/_weights/
+.data/
+data/
+prints-*/

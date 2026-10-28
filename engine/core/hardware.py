@@ -55,6 +55,9 @@ class GPUInfo:
     compute_capability: tuple[int, int] | None = None  # só NVIDIA
     driver: str = ""
     source: str = ""  # qual sonda encontrou
+    dxgi_index: int | None = None   # ordem do Windows (= device_id do DirectML)
+    cuda_index: int | None = None   # ordem do CUDA (= device_id do CUDA/TensorRT)
+    shared_mb: int = 0              # memória compartilhada informada pelo DXGI
 
     @property
     def arch(self) -> str:
@@ -107,7 +110,8 @@ class GPUInfo:
     def effective_vram_mb(self, ram_mb: int) -> int:
         """Integradas usam RAM compartilhada: o Windows libera até metade da RAM; usamos uma fatia segura."""
         if self.integrated:
-            return max(self.vram_mb, min(ram_mb // 4, 4096))
+            budget = self.shared_mb // 2 if self.shared_mb else ram_mb // 4
+            return max(self.vram_mb, min(budget, 4096))
         return self.vram_mb
 
 
@@ -132,6 +136,19 @@ class HardwareProfile:
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, ensure_ascii=False, default=str)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "HardwareProfile":
+        """Reconstrói a partir do JSON do `detect` (a interface monta planos sem reprocessar)."""
+        gpus = []
+        for g in d.get("gpus", []):
+            g = dict(g)
+            g["vendor"] = Vendor(g["vendor"])
+            cc = g.get("compute_capability")
+            g["compute_capability"] = tuple(cc) if cc else None
+            gpus.append(GPUInfo(**{k: v for k, v in g.items() if k in GPUInfo.__dataclass_fields__}))
+        fields = {k: v for k, v in d.items() if k in cls.__dataclass_fields__ and k != "gpus"}
+        return cls(gpus=gpus, **fields)
 
 
 # --------------------------------------------------------------------------- #
@@ -186,6 +203,9 @@ def _merge(gpus: list[GPUInfo], new: GPUInfo) -> None:
             g.vram_mb = max(g.vram_mb, new.vram_mb)
             g.compute_capability = g.compute_capability or new.compute_capability
             g.driver = g.driver or new.driver
+            g.dxgi_index = g.dxgi_index if g.dxgi_index is not None else new.dxgi_index
+            g.cuda_index = g.cuda_index if g.cuda_index is not None else new.cuda_index
+            g.shared_mb = max(g.shared_mb, new.shared_mb)
             return
     gpus.append(new)
 
@@ -223,7 +243,7 @@ def probe_torch(gpus: list[GPUInfo]) -> str | None:
 def probe_nvidia_smi(gpus: list[GPUInfo]) -> None:
     out = _run(["nvidia-smi", "--query-gpu=name,memory.total,driver_version,compute_cap",
                 "--format=csv,noheader,nounits"])
-    for line in out.strip().splitlines():
+    for i, line in enumerate(out.strip().splitlines()):
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 3:
             continue
@@ -231,7 +251,7 @@ def probe_nvidia_smi(gpus: list[GPUInfo]) -> None:
         if len(parts) >= 4 and re.match(r"^\d+\.\d+$", parts[3]):
             cc = tuple(int(x) for x in parts[3].split("."))
         _merge(gpus, GPUInfo(parts[0], Vendor.NVIDIA, int(float(parts[1])), cc, parts[2],
-                             source="nvidia-smi"))
+                             source="nvidia-smi", cuda_index=i))
 
 
 def probe_rocm_smi(gpus: list[GPUInfo]) -> None:
@@ -248,6 +268,79 @@ def probe_rocm_smi(gpus: list[GPUInfo]) -> None:
         name = card.get("Card series") or card.get("Card SKU") or "AMD GPU"
         total = card.get("VRAM Total Memory (B)") or 0
         _merge(gpus, GPUInfo(name, Vendor.AMD, int(total) // 2**20, source="rocm-smi"))
+
+
+_VENDOR_IDS = {0x10DE: Vendor.NVIDIA, 0x1002: Vendor.AMD, 0x1022: Vendor.AMD, 0x8086: Vendor.INTEL}
+
+
+def enumerate_dxgi(include_software: bool = False) -> list[dict]:
+    """
+    Lista os adaptadores na mesma ordem que o DirectML usa para device_id, com a VRAM real
+    (DedicatedVideoMemory é 64 bits, ao contrário do AdapterRAM do WMI). Só Windows; COM via ctypes.
+    """
+    if platform.system() != "Windows":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD), ("Data3", wintypes.WORD),
+                    ("Data4", ctypes.c_ubyte * 8)]
+
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class DXGI_ADAPTER_DESC1(ctypes.Structure):
+        _fields_ = [("Description", ctypes.c_wchar * 128), ("VendorId", wintypes.UINT),
+                    ("DeviceId", wintypes.UINT), ("SubSysId", wintypes.UINT), ("Revision", wintypes.UINT),
+                    ("DedicatedVideoMemory", ctypes.c_size_t), ("DedicatedSystemMemory", ctypes.c_size_t),
+                    ("SharedSystemMemory", ctypes.c_size_t), ("AdapterLuid", LUID), ("Flags", wintypes.UINT)]
+
+    # IID_IDXGIFactory1 = {770aae78-f26f-4dba-a829-253c83d1b387}
+    iid = GUID(0x770AAE78, 0xF26F, 0x4DBA, (ctypes.c_ubyte * 8)(0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87))
+    try:
+        dxgi = ctypes.WinDLL("dxgi")
+    except OSError:
+        return []
+    factory = ctypes.c_void_p()
+    if dxgi.CreateDXGIFactory1(ctypes.byref(iid), ctypes.byref(factory)) != 0 or not factory:
+        return []
+
+    def method(obj, index, restype, *argtypes):
+        vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        return ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(vtbl[index])
+
+    result = []
+    try:
+        enum_adapters1 = method(factory, 12, ctypes.c_long, wintypes.UINT, ctypes.POINTER(ctypes.c_void_p))
+        i = 0
+        while True:
+            adapter = ctypes.c_void_p()
+            if enum_adapters1(factory, i, ctypes.byref(adapter)) != 0:  # DXGI_ERROR_NOT_FOUND
+                break
+            desc = DXGI_ADAPTER_DESC1()
+            hr = method(adapter, 10, ctypes.c_long, ctypes.POINTER(DXGI_ADAPTER_DESC1))(adapter, ctypes.byref(desc))
+            method(adapter, 2, wintypes.ULONG)(adapter)  # Release
+            software = bool(desc.Flags & 2)  # DXGI_ADAPTER_FLAG_SOFTWARE (Microsoft Basic Render Driver)
+            if hr == 0 and (include_software or not software):
+                result.append({
+                    "index": i, "name": desc.Description, "vendor_id": desc.VendorId,
+                    "dedicated_mb": desc.DedicatedVideoMemory // 2**20,
+                    "shared_mb": desc.SharedSystemMemory // 2**20, "software": software,
+                })
+            i += 1
+    finally:
+        method(factory, 2, wintypes.ULONG)(factory)
+    return result
+
+
+def probe_dxgi(gpus: list[GPUInfo]) -> None:
+    for a in enumerate_dxgi():
+        vendor = _VENDOR_IDS.get(a["vendor_id"]) or _vendor_from_name(a["name"])
+        if vendor == Vendor.CPU:
+            continue
+        _merge(gpus, GPUInfo(a["name"], vendor, a["dedicated_mb"], source="dxgi",
+                             dxgi_index=a["index"], shared_mb=a["shared_mb"]))
 
 
 def probe_windows(gpus: list[GPUInfo]) -> None:
@@ -336,7 +429,12 @@ def detect_hardware() -> HardwareProfile:
     torch_backend = probe_torch(gpus)
     probe_nvidia_smi(gpus)
     probe_rocm_smi(gpus)
-    probe_windows(gpus)
+    try:
+        probe_dxgi(gpus)
+    except Exception:  # noqa: BLE001 - sonda opcional, nunca derruba a detecção
+        pass
+    if not any(g.dxgi_index is not None for g in gpus):
+        probe_windows(gpus)
     vulkan = probe_vulkan(gpus)
     providers = probe_onnxruntime()
     notes: list[str] = []
@@ -373,6 +471,8 @@ class ExecutionPlan:
     denoise: str
     nvenc: bool
     reasons: list[str] = field(default_factory=list)
+    gpu_name: str | None = None
+    device_id: int = 0          # device_id do runtime escolhido para a GPU do plano
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, ensure_ascii=False, default=str)
@@ -483,9 +583,16 @@ def choose_plan(hw: HardwareProfile, force: Preset | None = None, gpu_index: int
 
     nvenc = any(h in hw.ffmpeg_hwaccels for h in ("cuda", "nvdec")) and nvidia
 
+    device_id = 0
+    if g is not None:
+        if backend == Backend.DIRECTML and g.dxgi_index is not None:
+            device_id = g.dxgi_index
+        elif backend in (Backend.CUDA, Backend.TENSORRT) and g.cuda_index is not None:
+            device_id = g.cuda_index
+
     return ExecutionPlan(preset, backend, table["precision"], tile, table["batch"],
                          table["sr"], table["face"], table["interp"], table["denoise"],
-                         nvenc, why)
+                         nvenc, why, g.name if g else None, device_id)
 
 
 if __name__ == "__main__":

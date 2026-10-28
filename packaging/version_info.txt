@@ -1,0 +1,16 @@
+VSVersionInfo(
+  ffi=FixedFileInfo(filevers=(0, 2, 0, 0), prodvers=(0, 2, 0, 0), mask=0x3f, flags=0x0, OS=0x40004,
+                    fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([StringTable('041604B0', [
+      StringStruct('CompanyName', 'VideoImprove (open source)'),
+      StringStruct('FileDescription', 'VideoImprove - old video restoration with AI'),
+      StringStruct('FileVersion', '0.2.0'),
+      StringStruct('InternalName', 'VideoImprove'),
+      StringStruct('LegalCopyright', 'Apache-2.0'),
+      StringStruct('OriginalFilename', 'VideoImprove.exe'),
+      StringStruct('ProductName', 'VideoImprove'),
+      StringStruct('ProductVersion', '0.2.0')])]),
+    VarFileInfo([VarStruct('Translation', [1046, 1200])])
+  ]
+)
