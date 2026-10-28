@@ -149,6 +149,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           [ -d "prints-$VIDEOIMPROVE_FLAVOR" ] || exit 0
+          [ "$REL" = "dev" ] || [ "${{ job.status }}" = "failure" ] || exit 0   # release de versão fica limpa
           7z a -tzip "diagnostico-$VIDEOIMPROVE_FLAVOR.zip" "./prints-$VIDEOIMPROVE_FLAVOR/*" > /dev/null
           gh release upload "$REL" "diagnostico-$VIDEOIMPROVE_FLAVOR.zip" --clobber
 
