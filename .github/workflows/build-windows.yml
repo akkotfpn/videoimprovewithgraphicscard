@@ -103,9 +103,14 @@ jobs:
         shell: bash
         run: |
           D=dist/VideoImprove
-          "$D/videoimprove-cli.exe" detect
-          "$D/videoimprove-cli.exe" selftest
-          python -c "from engine.core.hardware import enumerate_dxgi; print('DXGI:', enumerate_dxgi(include_software=True))"
+          mkdir -p "prints-$VIDEOIMPROVE_FLAVOR"
+          DIAG="prints-$VIDEOIMPROVE_FLAVOR/diagnostico.txt"
+          { echo "== tamanhos"; du -sh "$D" "$D/_internal" "$D/bin" "$D/models"; } >> "$DIAG"
+          { echo "== detect"; "$D/videoimprove-cli.exe" detect; } >> "$DIAG" 2>&1
+          { echo "== DXGI"; python -c "from engine.core.hardware import enumerate_dxgi; print(enumerate_dxgi(include_software=True))"; } >> "$DIAG" 2>&1
+          echo "== selftest" >> "$DIAG"
+          "$D/videoimprove-cli.exe" selftest >> "$DIAG" 2>&1 || { cat "$DIAG"; exit 1; }
+          cat "$DIAG"
 
       - name: Conferir DLLs NVIDIA
         if: matrix.flavor == 'nvidia'
@@ -137,14 +142,15 @@ jobs:
           if ($p.ExitCode -ne 0) { exit 1 }
           Remove-Item -Recurse -Force "dist\VideoImprove\data" -ErrorAction SilentlyContinue
 
-      - name: Guardar prints
+      - name: Guardar prints e diagnóstico na release
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: prints-${{ matrix.flavor }}
-          path: prints-${{ matrix.flavor }}
-          retention-days: 7
-          if-no-files-found: ignore
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ -d "prints-$VIDEOIMPROVE_FLAVOR" ] || exit 0
+          7z a -tzip "diagnostico-$VIDEOIMPROVE_FLAVOR.zip" "./prints-$VIDEOIMPROVE_FLAVOR/*" > /dev/null
+          gh release upload "$REL" "diagnostico-$VIDEOIMPROVE_FLAVOR.zip" --clobber
 
       - name: Compactar
         shell: pwsh
