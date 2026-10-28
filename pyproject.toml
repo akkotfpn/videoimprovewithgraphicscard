@@ -8,13 +8,14 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
     "pillow>=10",
-    "onnxruntime>=1.18",   # CPU; os packs de GPU substituem por uma das variantes abaixo
 ]
 
+# Escolha UM runtime: os pacotes onnxruntime-* conflitam entre si se instalados juntos.
 [project.optional-dependencies]
-nvidia = ["onnxruntime-gpu>=1.20"]          # CUDA + TensorRT EP
-directml = ["onnxruntime-directml>=1.18"]   # Windows: AMD, Intel, NVIDIA via DX12
-openvino = ["onnxruntime-openvino>=1.18"]   # Intel
+nvidia = ["onnxruntime-gpu[cuda,cudnn]>=1.21"]  # RTX/GTX: CUDA e cuDNN vêm como pacotes pip
+directml = ["onnxruntime-directml>=1.18"]       # Windows, qualquer GPU DX12: Intel/AMD integrada, GTX 1660, RX
+openvino = ["onnxruntime-openvino>=1.18"]       # Intel (Linux ou Windows)
+cpu = ["onnxruntime>=1.18"]
 dev = ["pytest>=8", "psutil"]
 
 [project.scripts]

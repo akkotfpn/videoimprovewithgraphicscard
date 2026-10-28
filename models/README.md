@@ -1,6 +1,6 @@
 # Modelos
 
-Os pesos não ficam no git (veja `.gitignore`). Na fase 1, um `manifest.json` aqui vai listar cada modelo com URL, SHA-256, licença e preset, e o app baixa sob demanda.
+Os pesos e os `.onnx` gerados não vão para o git. Instale com `python -m engine models install all`: o comando baixa os pesos oficiais para `models/_weights/`, confere o SHA-256 e gera `<nome>.onnx` (FP32) e `<nome>.fp16.onnx` nesta pasta. O catálogo fica em `engine/models/catalog.py`.
 
 | Modelo | Tarefa | Licença dos pesos | Pode ir no instalador? |
 |---|---|---|---|

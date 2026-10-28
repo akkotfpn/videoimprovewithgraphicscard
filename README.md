@@ -1,43 +1,80 @@
 # videoimprovewithgraphicscard
 
-Restauração e upscaling de vídeos antigos (fitas VHS digitalizadas, Hi8, filmes caseiros) que se adapta ao hardware: usa TensorRT e modelos pesados numa RTX 50, e cai automaticamente para modelos leves, tiling e filtros clássicos em GPUs antigas ou só na CPU.
+Restauração e upscaling de vídeos antigos (fitas VHS digitalizadas, Hi8, filmes caseiros) que roda em **qualquer PC mediano**: vídeo integrado Intel/AMD, GTX 1660 e afins. Em placas de ponta (RTX 40/50), usa modelos mais pesados e TensorRT.
 
-> Estado: **fase 0**. A engine em Python já detecta o hardware, escolhe o preset e roda o pipeline completo (desentrelaçar → denoise → upscale → interpolação → encode com áudio original). Os modelos de IA reais entram na fase 1. Veja o [planejamento completo](docs/ARQUITETURA.md).
+> Estado: **fase 1 em andamento**. A engine já detecta o hardware, escolhe o preset, baixa e converte os modelos Real-ESRGAN para ONNX **sem PyTorch** e roda o pipeline completo (desentrelaçar → denoise → IA → interpolação → encode com o áudio original). Veja o [planejamento](docs/ARQUITETURA.md).
 
-## Requisitos
+## Rodando no Windows
 
-- Python 3.11+
-- FFmpeg e ffprobe no PATH
-- Opcional: `onnxruntime-gpu` (NVIDIA), `onnxruntime-directml` (Windows, qualquer GPU) ou `onnxruntime-openvino` (Intel)
+### 1. Instalar Python, Git e FFmpeg (uma vez)
 
-## Uso rápido
+No PowerShell:
 
-```bash
-pip install -e ".[dev]"            # ou .[nvidia] / .[directml] / .[openvino]
-
-# o que o programa enxerga na sua máquina e qual preset escolheria
-python -m engine detect
-
-# upscale 2x + dobrar FPS (sem modelo: redimensionamento clássico, serve para testar)
-python -m engine run fita.avi fita_restaurada.mkv --scale 2 --interpolate
-
-# com um modelo ONNX de super-resolução
-python -m engine run fita.avi saida.mkv --scale 4 --model models/realesr-general-x4v3.onnx
-
-# forçar preset e tamanho de tile
-python -m engine run fita.avi saida.mkv --preset economico --tile 256
+```powershell
+winget install Python.Python.3.12 Git.Git Gyan.FFmpeg
 ```
 
-Use `.mkv` na saída para copiar o áudio original sem recompressão.
+Feche e abra o terminal de novo para o PATH atualizar.
+
+### 2. Baixar o projeto e criar o ambiente
+
+```powershell
+git clone https://github.com/akkotfpn/videoimprovewithgraphicscard.git
+cd videoimprovewithgraphicscard
+py -3.12 -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+Se o PowerShell bloquear o `Activate.ps1`, rode uma vez: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+
+### 3. Instalar o runtime da sua placa (escolha **um**)
+
+| Sua placa | Comando |
+|---|---|
+| NVIDIA RTX (20/30/40/50) | `pip install -e ".[nvidia,dev]"` |
+| Qualquer outra no Windows: Intel UHD/Iris/Arc, AMD integrada ou RX, GTX 1650/1660 | `pip install -e ".[directml,dev]"` |
+| Sem GPU | `pip install -e ".[cpu,dev]"` |
+
+### 4. Detectar, instalar modelos e medir
+
+```powershell
+python -m engine detect                         # o que foi detectado e qual preset
+python -m engine models install all             # baixa e converte os modelos (~75 MB, sem PyTorch)
+python -m engine bench                          # velocidade do modelo do seu preset
+python -m engine bench --model realesr_general_x4v3   # modelo leve (o dos PCs medianos)
+python -m engine bench --model realesrgan_x4plus      # modelo pesado
+```
+
+O `bench` mostra quantos frames por segundo a sua máquina processa e estima quanto tempo leva **1 hora de fita**.
+
+### 5. Restaurar um vídeo
+
+```powershell
+python -m engine run "C:\Videos\fita.avi" "C:\Videos\fita_restaurada.mkv"
+```
+
+Opções úteis:
+
+- `--scale 2` (padrão) ou `--scale 4`. Para VHS, 2× costuma ficar mais natural.
+- `--interpolate` dobra o FPS.
+- `--preset economico` força um preset.
+- `--model realesrgan_x4plus` escolhe o modelo.
+- Use `.mkv` na saída para copiar o áudio original sem recompressão.
 
 ## Presets
 
-| Preset | Para quem | Backend |
-|---|---|---|
-| Ultra | RTX 40/50 com 12 GB+ | TensorRT FP8/FP16 |
-| Equilibrado | GPUs com 8 GB+ | CUDA / DirectML / ROCm / OpenVINO, FP16 |
-| Econômico | GPUs antigas ou com pouca VRAM | NCNN-Vulkan / DirectML, tiling |
-| CPU | sem GPU utilizável | ONNX Runtime CPU + filtros FFmpeg |
+| Preset | Exemplo de placa | Runtime | Modelo padrão |
+|---|---|---|---|
+| Ultra | RTX 4070/5070 ou superior (FP8, 12 GB+) | TensorRT ou CUDA | Real-ESRGAN x4plus* |
+| Equilibrado | RTX 2060/3060, RX 6600+, Arc A750 | CUDA / DirectML / ROCm / OpenVINO | Real-ESRGAN x4plus |
+| Econômico | GTX 1650/1660, Intel Iris Xe/UHD, AMD Radeon 680M/780M | DirectML / Vulkan | Real-ESRGAN compact |
+| CPU | sem GPU utilizável | ONNX Runtime CPU | filtros clássicos (IA só se pedir) |
+
+\* RealBasicVSR e restauração de rostos entram na fase 2.
+
+## Licença
+
+Código sob [Apache-2.0](LICENSE). Os pesos dos modelos têm licenças próprias e não fazem parte do repositório; veja [models/README.md](models/README.md).
 
 ## Testes
 
@@ -45,8 +82,8 @@ Use `.mkv` na saída para copiar o áudio original sem recompressão.
 python -m pytest
 ```
 
-Os testes simulam várias placas (RTX 5090, 4070, 3060, Radeon, GTX 1050, Intel Arc sem runtime) e processam um vídeo VHS sintético entrelaçado com áudio, verificando resolução, contagem de frames, espaço de cor e sincronia do áudio.
-
-## Licença
-
-Código sob [Apache-2.0](LICENSE). Pesos de modelos têm licenças próprias e não fazem parte deste repositório; veja [models/README.md](models/README.md).
+Os testes incluem:
+- placas simuladas, da Intel UHD à RTX 5090;
+- modelos ONNX reais conferidos contra uma implementação de referência em NumPy;
+- proteção contra checkpoints maliciosos;
+- um vídeo VHS sintético processado de ponta a ponta, conferindo resolução, contagem de frames, espaço de cor e sincronia do áudio.

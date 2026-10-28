@@ -195,11 +195,38 @@ As sondas falham em silêncio e o resultado é mesclado, então a mesma placa vi
 | Preset | Condição | Backend | Precisão | Tile | Modelos |
 |---|---|---|---|---|---|
 | **Ultra** | NVIDIA com FP8 (≥ 8.9) e ≥ 12 GB | TensorRT (ou CUDA FP16 se TRT ausente) | FP8 / FP16 | sem tile se ≥ 16 GB, senão 768 | RealBasicVSR + CodeFormer/GFPGAN + RIFE + SCUNet |
-| **Equilibrado** | ≥ 8 GB com FP16 | CUDA / DirectML / ROCm / OpenVINO | FP16 | 512 | Real-ESRGAN x4plus + GFPGAN + RIFE lite + nlmeans |
-| **Econômico** | 2–8 GB ou só Vulkan | NCNN-Vulkan / DirectML | FP16 | 256 | compact x4v3 + rife-ncnn + hqdn3d |
-| **CPU** | sem GPU ou sem runtime | ONNX Runtime CPU | INT8 / FP32 | 192 | compact x4v3 + filtros FFmpeg |
+| **Equilibrado** | ≥ 6 GB com Tensor Cores / unidades de matriz (RTX 20/30, RX 7000, Arc dedicada) | CUDA / DirectML / ROCm / OpenVINO | FP16 | 512 | Real-ESRGAN x4plus + GFPGAN + RIFE lite + nlmeans |
+| **Econômico** | GPU dedicada sem Tensor Cores ou com pouca VRAM (GTX 1650/1660), ou integrada (Intel UHD/Iris/Arc Graphics, AMD Radeon 680M/780M) | DirectML no Windows / NCNN-Vulkan | FP16 (troca sozinho para FP32 se der NaN) | até 384, blocos balanceados | compact x4v3 + hqdn3d; rosto e RIFE opcionais |
+| **CPU** | sem GPU ou sem runtime | ONNX Runtime CPU | FP32 | sem blocos | filtros clássicos; IA só se o usuário pedir |
 
 O usuário pode sempre forçar um preset (`--preset`), e a UI deve mostrar o motivo da escolha automática (campo `reasons` do plano).
+
+### 4.3.1 Meta: qualquer PC mediano
+
+O Econômico não é um "modo de pena". É o mesmo modelo de IA (Real-ESRGAN compact), rodando por DirectML, que funciona em qualquer GPU com DirectX 12 sem instalar CUDA. Detalhes que fazem isso funcionar:
+
+- **GTX 16 não tem Tensor Cores** (é Turing, mas sem as unidades de matriz). Ela entra no Econômico, não no Equilibrado.
+- **Vídeo integrado usa RAM compartilhada.** O Windows informa só a reserva dedicada (~128 MB), então o orçamento real é estimado como ¼ da RAM, até 4 GB.
+- **FP16 com proteção.** Se a GPU gerar NaN em meia precisão, o estágio recarrega a versão FP32 do modelo automaticamente.
+- **Blocos balanceados e com tamanho fixo.** O frame é dividido em blocos iguais (720×480 → 4 blocos de 360×240) e as bordas são preenchidas até o tamanho fixo. Assim o DirectML compila o grafo uma vez só.
+- **Notebook com duas GPUs:** a dedicada sempre tem prioridade sobre a integrada.
+
+Ordem de grandeza esperada para o modelo compact em 720×480, upscale 2× (cerca de 0,8 TFLOP por frame). São estimativas a confirmar com `python -m engine bench` em máquinas reais:
+
+| Máquina | Estimativa por hora de fita |
+|---|---|
+| RTX 5070 (CUDA/TensorRT) | menos de 1 h |
+| GTX 1660 (DirectML) | 2–4 h |
+| Intel Iris Xe / AMD 780M (DirectML) | 6–12 h (rodar durante a noite) |
+| Só CPU, 8 núcleos | dezenas de horas, por isso o padrão na CPU é filtro clássico |
+
+### 4.3.2 Modelos sem PyTorch
+
+`python -m engine models install` baixa os pesos oficiais do Real-ESRGAN (`.pth`), confere o SHA-256 e converte para ONNX FP32 e FP16 com um conversor próprio (`engine/models/`). Não é preciso PyTorch (~2 GB), então dá para fazer isso dentro do instalador em qualquer máquina.
+
+- **Leitor de `.pth`:** aceita só tensores e dicionários e recusa qualquer outra classe no pickle. Arquivos `.pth` maliciosos não executam código.
+- **Gerador de ONNX:** escreve o protobuf diretamente. Suporta SRVGGNetCompact e RRDBNet; o resultado do compact bate com uma implementação de referência em NumPy (erro < 1e-5).
+- **Força do denoise do compact:** ajustável com `--denoise 0..1` (interpolação de pesos DNI, a mesma técnica do Real-ESRGAN oficial).
 
 ### 4.4 Fallback em tempo de execução
 
@@ -230,8 +257,13 @@ A escolha inicial é uma estimativa. Durante a execução:
 - [x] Testes, incluindo vídeo VHS sintético de ponta a ponta
 
 ### Fase 1: MVP com IA real (2–3 semanas)
-- [ ] `tools/export_onnx.py`: exportar Real-ESRGAN x4plus e realesr-general-x4v3 para ONNX (FP32 e FP16, eixos dinâmicos)
-- [ ] Gerenciador de modelos: manifesto JSON com URL, SHA-256, licença e preset; download com verificação
+- [x] Conversão Real-ESRGAN x4plus e realesr-general-x4v3 para ONNX FP32/FP16 **sem PyTorch**
+- [x] Catálogo de modelos com URL, SHA-256 e licença; download com verificação (`engine models`)
+- [x] Detecção correta de GTX 16 (sem Tensor Cores) e de vídeo integrado (RAM compartilhada)
+- [x] Proteção FP16 → FP32 automática quando a GPU gera NaN
+- [x] Blocos balanceados de tamanho fixo (bom para DirectML/TensorRT)
+- [x] `engine bench`: mede fps reais e estima o tempo por hora de fita
+- [ ] Validar no Windows: RTX 5070 (CUDA e DirectML) e uma máquina mediana
 - [ ] Estágio RIFE em ONNX
 - [ ] Estágio NCNN-Vulkan via binários `realesrgan-ncnn-vulkan` e `rife-ncnn-vulkan` (subprocesso com pipe)
 - [ ] Prévia: processar 10 s do meio do vídeo e gerar comparação lado a lado
@@ -264,6 +296,7 @@ videoimprovewithgraphicscard/
 ├── engine/                  # motor de processamento (Python)
 │   ├── __main__.py          # python -m engine
 │   ├── cli.py               # CLI e protocolo JSON para a UI
+│   ├── models/              # catálogo, leitor .pth e conversor ONNX sem PyTorch
 │   ├── core/
 │   │   ├── hardware.py      # detecção de GPU e escolha de preset
 │   │   ├── pipeline.py      # FFmpeg ⇄ estágios ⇄ FFmpeg
@@ -315,6 +348,7 @@ Os packs ficam numa pasta própria do app, isolados do sistema, sem conflito com
 
 ## 8. Próximos passos sugeridos
 
-1. Exportar o `realesr-general-x4v3` para ONNX e validar o `OnnxUpscale` com um trecho real de VHS digitalizado.
-2. Rodar `python -m engine detect` no seu PC Windows para confirmar a detecção com uma GPU real.
-3. Escolher entre Tauri e PySide6 para a UI antes de começar a fase 3.
+1. Rodar `detect`, `models install all` e `bench` no PC com a RTX 5070, com CUDA e também com DirectML (para simular um PC mediano).
+2. Processar um trecho real de VHS digitalizado e comparar `--denoise` 0,3 / 0,5 / 0,8.
+3. RIFE em ONNX e prévia lado a lado.
+4. Escolher entre Tauri e PySide6 para a UI antes da fase 3.

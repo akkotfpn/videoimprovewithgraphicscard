@@ -71,17 +71,44 @@ class GPUInfo:
         }.get((major, minor), f"sm_{major}{minor}")
 
     @property
+    def integrated(self) -> bool:
+        """Vídeo integrado (usa RAM do sistema): Intel UHD/Iris/Arc Graphics, AMD Radeon Graphics/780M."""
+        n = self.name.lower()
+        if self.vendor == Vendor.INTEL:
+            # Arc dedicada tem modelo com letra+3 dígitos (A770, B580); a integrada é só "Arc Graphics"
+            return not re.search(r"arc\S*\s+(pro\s+)?[ab]\d{3}", n)
+        if self.vendor == Vendor.AMD:
+            dedicated = re.search(r"\brx\b|radeon pro w|instinct|radeon vii|\br9\b|\br7\b", n)
+            return not dedicated
+        return False
+
+    @property
+    def is_gtx16(self) -> bool:
+        return self.vendor == Vendor.NVIDIA and "gtx 16" in self.name.lower()
+
+    @property
+    def has_tensor_cores(self) -> bool:
+        """Unidades de matriz para FP16 rápido. A GTX 16 é Turing mas NÃO tem Tensor Cores."""
+        if self.vendor == Vendor.NVIDIA:
+            cc = self.compute_capability
+            return bool(cc and cc >= (7, 0)) and not self.is_gtx16
+        if self.vendor == Vendor.INTEL:
+            return not self.integrated  # XMX só nas Arc dedicadas
+        if self.vendor == Vendor.AMD:
+            return not self.integrated  # WMMA a partir de RDNA 3
+        return self.vendor == Vendor.APPLE
+
+    @property
     def supports_fp8(self) -> bool:
         # Tensor Cores FP8: Ada (8.9) e Blackwell (10.x/12.x)
         cc = self.compute_capability
-        return bool(cc and cc >= (8, 9))
+        return self.vendor == Vendor.NVIDIA and bool(cc and cc >= (8, 9))
 
-    @property
-    def supports_fp16_tensor(self) -> bool:
-        cc = self.compute_capability
-        if self.vendor == Vendor.NVIDIA:
-            return bool(cc and cc >= (7, 0))
-        return self.vendor in (Vendor.AMD, Vendor.INTEL, Vendor.APPLE)
+    def effective_vram_mb(self, ram_mb: int) -> int:
+        """Integradas usam RAM compartilhada: o Windows libera até metade da RAM; usamos uma fatia segura."""
+        if self.integrated:
+            return max(self.vram_mb, min(ram_mb // 4, 4096))
+        return self.vram_mb
 
 
 @dataclass
@@ -98,7 +125,9 @@ class HardwareProfile:
 
     @property
     def best_gpu(self) -> GPUInfo | None:
-        return max(self.gpus, key=lambda g: g.vram_mb, default=None)
+        # dedicada sempre ganha da integrada (notebook com Iris Xe + GTX 1650, por exemplo)
+        return max(self.gpus, key=lambda g: (not g.integrated, g.effective_vram_mb(self.ram_mb)),
+                   default=None)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, ensure_ascii=False, default=str)
@@ -314,10 +343,17 @@ class ExecutionPlan:
 
 
 def choose_plan(hw: HardwareProfile, force: Preset | None = None) -> ExecutionPlan:
+    """
+    Meta do projeto: qualquer PC mediano tem que conseguir restaurar (GTX 1660, Intel Iris Xe,
+    AMD Radeon 680M/780M). Por isso o Econômico é um caminho de primeira classe, não um "modo de pena":
+    mesmo modelo de IA (compact), só que com tiles menores e sem os estágios caros.
+    """
     g = hw.best_gpu
     why: list[str] = []
     ort = set(hw.ort_providers)
-    vram = g.vram_mb if g else 0
+    vram = g.effective_vram_mb(hw.ram_mb) if g else 0
+    if g and g.integrated:
+        why.append(f"vídeo integrado: usando ~{vram} MB da RAM compartilhada")
 
     # ---------- escolha do preset ----------
     if force:
@@ -326,39 +362,51 @@ def choose_plan(hw: HardwareProfile, force: Preset | None = None) -> ExecutionPl
     elif g is None:
         preset = Preset.CPU
         why.append("nenhuma GPU encontrada")
-    elif g.vendor == Vendor.NVIDIA and g.supports_fp8 and vram >= 12_000:
+    elif g.supports_fp8 and vram >= 11_500:   # RTX 4070+/5070+ (12 GB reportam ~11,9-12,2 GB)
         preset = Preset.ULTRA
         why.append(f"{g.arch} com {vram} MB e FP8")
-    elif vram >= 8_000 and g.supports_fp16_tensor:
+    elif g.has_tensor_cores and vram >= 6_000:
         preset = Preset.EQUILIBRADO
-        why.append(f"{vram} MB com FP16")
-    elif vram >= 2_000 or hw.vulkan_available:
+        why.append(f"{vram} MB com unidades de matriz FP16")
+    elif not g.integrated and vram >= 3_000:
         preset = Preset.ECONOMICO
-        why.append(f"VRAM limitada ({vram} MB) ou só Vulkan disponível")
+        why.append(f"GPU dedicada sem Tensor Cores ou com pouca VRAM ({vram} MB)")
+    elif g.integrated:
+        preset = Preset.ECONOMICO
+        why.append("integrada roda o modelo compact com tiles pequenos")
+    elif hw.vulkan_available:
+        preset = Preset.ECONOMICO
+        why.append(f"VRAM baixa ({vram} MB), caminho Vulkan")
     else:
         preset = Preset.CPU
         why.append("GPU fraca demais")
 
     # ---------- escolha do backend (o que realmente está instalado) ----------
-    if g and g.vendor == Vendor.NVIDIA and "TensorrtExecutionProvider" in ort and preset == Preset.ULTRA:
+    nvidia = g is not None and g.vendor == Vendor.NVIDIA
+    if nvidia and "TensorrtExecutionProvider" in ort and preset == Preset.ULTRA:
         backend = Backend.TENSORRT
-    elif g and g.vendor == Vendor.NVIDIA and (hw.torch_backend == "cuda" or "CUDAExecutionProvider" in ort):
+    elif nvidia and (hw.torch_backend == "cuda" or "CUDAExecutionProvider" in ort):
         backend = Backend.CUDA
     elif g and g.vendor == Vendor.AMD and (hw.torch_backend == "rocm" or "MIGraphXExecutionProvider" in ort):
         backend = Backend.ROCM
     elif g and g.vendor == Vendor.INTEL and "OpenVINOExecutionProvider" in ort:
         backend = Backend.OPENVINO
-    elif "DmlExecutionProvider" in ort:
+    elif g and "DmlExecutionProvider" in ort:
+        # DirectML: o caminho universal no Windows (GTX 1660, Intel UHD/Iris/Arc, AMD integrada ou RX)
         backend = Backend.DIRECTML
     elif hw.vulkan_available and g:
         backend = Backend.NCNN_VULKAN
     else:
         backend = Backend.CPU
-        if preset != Preset.CPU:
-            why.append(f"GPU existe mas nenhum runtime acelerado instalado -> rebaixado para CPU")
-            preset = Preset.CPU
+        if g and preset != Preset.CPU:
+            why.append("GPU existe mas nenhum runtime acelerado instalado -> CPU "
+                       "(instale onnxruntime-directml no Windows)")
+        preset = Preset.CPU
 
-    if preset == Preset.ULTRA and backend != Backend.TENSORRT:
+    if preset == Preset.ULTRA and backend not in (Backend.TENSORRT, Backend.CUDA):
+        preset = Preset.EQUILIBRADO
+        why.append("Ultra precisa de CUDA/TensorRT; com este runtime fica no Equilibrado")
+    elif preset == Preset.ULTRA and backend != Backend.TENSORRT:
         why.append("TensorRT ausente: Ultra roda em FP16 via CUDA")
 
     # ---------- parâmetros por preset ----------
@@ -370,19 +418,25 @@ def choose_plan(hw: HardwareProfile, force: Preset | None = None) -> ExecutionPl
         Preset.EQUILIBRADO: dict(precision="fp16", tile=512, batch=4,
                                  sr="realesrgan_x4plus", face="gfpgan_v1.4",
                                  interp="rife_v4_lite", denoise="ffmpeg_nlmeans"),
+        # Econômico: mesmo modelo compact do CPU, acelerado; rosto e RIFE desligados por padrão
+        # (o usuário pode ligar; bwdif mode=1 já entrega 59,94 fps reais sem custo de IA)
         Preset.ECONOMICO: dict(precision="fp16" if backend != Backend.CPU else "fp32",
-                               tile=256, batch=1, sr="realesr_general_x4v3",
-                               face=None, interp="rife_ncnn", denoise="ffmpeg_hqdn3d"),
-        Preset.CPU: dict(precision="int8", tile=192, batch=1, sr="realesr_general_x4v3",
+                               tile=384 if vram >= 3_000 else 256, batch=1,
+                               sr="realesr_general_x4v3", face=None, interp=None,
+                               denoise="ffmpeg_hqdn3d"),
+        # CPU: sem blocos (RAM sobra e blocos só somam sobreposição); o pipeline tem 1 frame por vez
+        # IA na CPU leva dezenas de horas por hora de fita: padrão é filtro clássico,
+        # IA só se o usuário pedir (--model), para trechos curtos
+        Preset.CPU: dict(precision="fp32", tile=0, batch=1, sr="classico",
                          face=None, interp=None, denoise="ffmpeg_hqdn3d"),
     }[preset]
 
-    # tile ajustado pela VRAM livre real (heurística: ~ VRAM/12 px de lado para x4)
+    # tile limitado pela VRAM (heurística: ~VRAM/12 px de lado para x4)
     tile = table["tile"]
     if tile and vram:
         tile = min(tile, max(128, (vram // 12) // 64 * 64))
 
-    nvenc = any(h in hw.ffmpeg_hwaccels for h in ("cuda", "nvdec")) and bool(g and g.vendor == Vendor.NVIDIA)
+    nvenc = any(h in hw.ffmpeg_hwaccels for h in ("cuda", "nvdec")) and nvidia
 
     return ExecutionPlan(preset, backend, table["precision"], tile, table["batch"],
                          table["sr"], table["face"], table["interp"], table["denoise"],

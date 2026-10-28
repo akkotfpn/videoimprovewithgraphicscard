@@ -124,3 +124,180 @@ def test_pipeline_upscale_interpolate_keeps_audio_sync(vhs_sample, tmp_path):
     vd = int(v["nb_read_frames"]) * 1001 / 60000
     ad = float(a.get("duration") or 0) or float(src_a.get("duration") or 3.0)
     assert abs(vd - ad) < 1 / 29.97 + 1e-3
+
+
+# ---------------- ONNX Runtime de verdade (modelos mínimos gerados no teste) ----------------
+from engine.stages.upscale import OnnxUpscale  # noqa: E402
+from engine.models.onnx_writer import sr_model  # noqa: E402
+
+
+@pytest.fixture
+def models(tmp_path):
+    sr_model(tmp_path / "sr.onnx", 4)
+    sr_model(tmp_path / "sr.fp16.onnx", 4, fp16=True, broken=True)
+    return tmp_path
+
+
+def _frames(n=2, h=100, w=130):
+    return np.random.default_rng(1).integers(0, 255, (n, h, w, 3), dtype=np.uint8)
+
+
+def test_onnx_tiled_matches_reference_and_probes_scale(models):
+    st = OnnxUpscale(models / "sr.onnx", 4, Backend.CPU, tile=32, overlap=8)
+    assert st.model_scale == 4
+    f = _frames()
+    out = st.process(f)
+    assert out.shape == (2, 400, 520, 3)
+    assert np.array_equal(out, f.repeat(4, 1).repeat(4, 2))  # tiles costurados sem emenda
+
+
+def test_onnx_4x_model_with_2x_output(models):
+    st = OnnxUpscale(models / "sr.onnx", 2, Backend.CPU, tile=64)
+    assert st.process(_frames(1)).shape == (1, 200, 260, 3)
+
+
+def test_fp16_nan_falls_back_to_fp32(models):
+    st = OnnxUpscale(models / "sr.fp16.onnx", 4, Backend.CPU, tile=0)
+    out = st.process(_frames(1, 20, 24))
+    assert st.dtype == np.float32 and st.model_path.name == "sr.onnx"
+    assert out.shape == (1, 80, 96, 3)
+
+
+def test_fp16_nan_without_fp32_sibling_raises(tmp_path):
+    sr_model(tmp_path / "only.fp16.onnx", 2, fp16=True, broken=True)
+    st = OnnxUpscale(tmp_path / "only.fp16.onnx", 2, Backend.CPU, tile=0)
+    with pytest.raises(RuntimeError, match="NaN"):
+        st.process(_frames(1, 8, 8))
+
+
+# ---------------- PCs medianos e a 5070 ----------------
+def test_rtx5070_is_ultra():
+    g = GPUInfo("NVIDIA GeForce RTX 5070", Vendor.NVIDIA, 12227, (12, 0))
+    p = choose_plan(hw(g, ["CUDAExecutionProvider"]))
+    assert p.preset == Preset.ULTRA and p.backend == Backend.CUDA and p.tile_size == 768
+
+
+def test_rtx5070_with_only_directml_drops_to_balanced():
+    g = GPUInfo("NVIDIA GeForce RTX 5070", Vendor.NVIDIA, 12227, (12, 0))
+    p = choose_plan(hw(g, ["DmlExecutionProvider"]))
+    assert p.preset == Preset.EQUILIBRADO and p.backend == Backend.DIRECTML
+
+
+def test_gtx1660_has_no_tensor_cores_and_uses_directml():
+    g = GPUInfo("NVIDIA GeForce GTX 1660 SUPER", Vendor.NVIDIA, 6144, (7, 5))
+    assert not g.has_tensor_cores
+    p = choose_plan(hw(g, ["DmlExecutionProvider"]))
+    assert p.preset == Preset.ECONOMICO and p.backend == Backend.DIRECTML
+    assert p.sr_model == "realesr_general_x4v3" and p.tile_size == 384
+
+
+def test_rtx2060_6gb_is_balanced():
+    g = GPUInfo("NVIDIA GeForce RTX 2060", Vendor.NVIDIA, 6144, (7, 5))
+    assert choose_plan(hw(g, ["CUDAExecutionProvider"])).preset == Preset.EQUILIBRADO
+
+
+@pytest.mark.parametrize("name,vendor", [
+    ("Intel(R) Iris(R) Xe Graphics", Vendor.INTEL),
+    ("Intel(R) UHD Graphics 630", Vendor.INTEL),
+    ("Intel(R) Arc(TM) Graphics", Vendor.INTEL),        # Meteor Lake integrada
+    ("AMD Radeon(TM) Graphics", Vendor.AMD),            # Ryzen APU genérico
+    ("AMD Radeon 780M Graphics", Vendor.AMD),
+])
+def test_integrated_gpus_get_economy_with_shared_memory(name, vendor):
+    g = GPUInfo(name, vendor, 128)  # o Windows reporta só a reserva dedicada
+    assert g.integrated
+    p = choose_plan(hw(g, ["DmlExecutionProvider"]))
+    assert p.preset == Preset.ECONOMICO and p.backend == Backend.DIRECTML
+    assert 128 <= p.tile_size <= 384
+
+
+@pytest.mark.parametrize("name,vendor", [
+    ("Intel(R) Arc(TM) A770 Graphics", Vendor.INTEL),
+    ("Intel(R) Arc(TM) B580 Graphics", Vendor.INTEL),
+    ("AMD Radeon RX 6600", Vendor.AMD),
+])
+def test_dedicated_not_marked_integrated(name, vendor):
+    assert not GPUInfo(name, vendor, 8192).integrated
+
+
+def test_laptop_prefers_dedicated_over_integrated():
+    h = hw(None, ["DmlExecutionProvider"])
+    h.gpus = [GPUInfo("Intel(R) Iris(R) Xe Graphics", Vendor.INTEL, 128),
+              GPUInfo("NVIDIA GeForce GTX 1650", Vendor.NVIDIA, 4096, (7, 5))]
+    assert h.best_gpu.name.endswith("1650")
+
+
+
+# ---------------- blocos balanceados ----------------
+from engine.core.tiling import balanced_tile  # noqa: E402
+
+
+def test_balanced_tile_for_vhs_frame():
+    assert balanced_tile(720, 480, 384) == (240, 360)   # 2x2 blocos, sem sobra
+    assert balanced_tile(720, 480, 0) == (0, 0)
+    assert balanced_tile(720, 480, 1000) == (480, 720)  # cabe inteiro
+
+
+def test_cpu_preset_does_not_tile():
+    assert choose_plan(hw(None)).tile_size == 0
+
+
+# ---------------- modelos reais (sem PyTorch) ----------------
+import pickle  # noqa: E402
+import zipfile  # noqa: E402
+
+from engine.models import catalog, realesrgan  # noqa: E402
+from engine.models.pth_loader import load_pth, state_dict  # noqa: E402
+
+WEIGHTS = Path(__file__).resolve().parents[1] / "models" / "_weights"
+needs_weights = pytest.mark.skipif(not (WEIGHTS / "realesr-general-x4v3.pth").exists(),
+                                   reason="rode: python -m engine models install all")
+
+
+def test_pth_loader_refuses_malicious_pickle(tmp_path):
+    class Evil:
+        def __reduce__(self):
+            import os
+            return (os.system, ("echo pwned",))
+    bad = tmp_path / "evil.pth"
+    with zipfile.ZipFile(bad, "w") as z:
+        z.writestr("archive/data.pkl", pickle.dumps(Evil()))
+    with pytest.raises(pickle.UnpicklingError):
+        load_pth(bad)
+
+
+@needs_weights
+def test_compact_onnx_matches_numpy_reference(tmp_path):
+    import onnxruntime as ort
+    sd = state_dict(WEIGHTS / "realesr-general-x4v3.pth")
+    assert realesrgan.detect_arch(sd) == "srvgg_compact"
+    realesrgan.export(sd, tmp_path / "c.onnx")
+    img = np.random.default_rng(0).random((3, 10, 12), dtype=np.float32)
+    sess = ort.InferenceSession(str(tmp_path / "c.onnx"), providers=["CPUExecutionProvider"])
+    y = sess.run(None, {"input": img[None]})[0][0]
+    assert y.shape == (3, 40, 48)
+    assert np.abs(y - realesrgan.run_compact_numpy(sd, img)).max() < 1e-4
+
+
+@needs_weights
+def test_rrdbnet_exports_and_upscales(tmp_path):
+    import onnxruntime as ort
+    sd = state_dict(WEIGHTS / "RealESRGAN_x4plus.pth")
+    assert realesrgan.detect_arch(sd) == "rrdbnet"
+    realesrgan.export(sd, tmp_path / "x.onnx")
+    yy, xx = np.mgrid[0:24, 0:24] / 24.0
+    img = (np.stack([np.sin(3 * xx), np.cos(2 * yy), xx * yy]) * 0.4 + 0.5).astype(np.float32)
+    y = ort.InferenceSession(str(tmp_path / "x.onnx"), providers=["CPUExecutionProvider"]).run(
+        None, {"input": img[None]})[0][0]
+    psnr = 10 * np.log10(1 / np.mean((np.clip(y, 0, 1) - img.repeat(4, 1).repeat(4, 2)) ** 2))
+    assert y.shape == (3, 96, 96) and psnr > 28
+
+
+@needs_weights
+def test_catalog_install_from_local_weights(tmp_path):
+    out = catalog.install("realesr_general_x4v3", models_dir=tmp_path, denoise=0.3,
+                          weights=[WEIGHTS / "realesr-general-x4v3.pth", WEIGHTS / "realesr-general-wdn-x4v3.pth"])
+    assert [p.name for p in out] == ["realesr_general_x4v3.onnx", "realesr_general_x4v3.fp16.onnx"]
+    st = OnnxUpscale(out[0], 2, Backend.CPU, tile=0)
+    assert st.model_scale == 4
+    assert st.process(_frames(1, 24, 32)).shape == (1, 48, 64, 3)

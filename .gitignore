@@ -16,3 +16,4 @@ cache/
 *.mp4
 *.mkv
 *.avi
+models/_weights/
