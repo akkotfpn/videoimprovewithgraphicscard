@@ -1,12 +1,28 @@
-# videoimprovewithgraphicscard
+# VideoImprove
 
-Restauração e upscaling de vídeos antigos (fitas VHS digitalizadas, Hi8, filmes caseiros) que roda em **qualquer PC mediano**: vídeo integrado Intel/AMD, GTX 1660 e afins. Em placas de ponta (RTX 40/50), usa modelos mais pesados e TensorRT.
+Restauração e upscaling de vídeos antigos (fitas VHS digitalizadas, Hi8, filmes caseiros) que roda em **qualquer PC mediano**: vídeo integrado Intel/AMD, GTX 1660 e afins. Em placas de ponta (RTX 40/50), usa modelos mais pesados.
 
-> Estado: **fase 1 em andamento**. A engine já detecta o hardware, escolhe o preset, baixa e converte os modelos Real-ESRGAN para ONNX **sem PyTorch** e roda o pipeline completo (desentrelaçar → denoise → IA → interpolação → encode com o áudio original). Veja o [planejamento](docs/ARQUITETURA.md).
+## Baixar e usar (Windows 10/11, 64 bits)
 
-## Rodando no Windows
+1. Vá em **[Releases](../../releases)** e baixe um dos zips:
+   - **VideoImprove-Universal-win64.zip**: qualquer placa de vídeo (Intel, AMD, NVIDIA, inclusive vídeo integrado).
+   - **VideoImprove-NVIDIA-win64.zip**: placas NVIDIA RTX ou GTX 16. Mais rápido nelas, download maior. Exige driver NVIDIA 580 ou mais novo.
+2. Extraia a pasta e abra o **VideoImprove.exe**. Não precisa instalar nada; funciona até de um pendrive.
+3. Arraste os vídeos para a janela, veja a prévia (opcional) e clique em **Restaurar**.
 
-### 1. Instalar Python, Git e FFmpeg (uma vez)
+Na primeira vez, o Windows pode avisar "O Windows protegeu o computador" (o programa não tem assinatura digital paga): clique em **Mais informações → Executar assim mesmo**.
+
+A pré-release **dev** é atualizada a cada mudança na branch `main`.
+
+---
+
+## Para desenvolvedores
+
+A engine e a interface são Python (ONNX Runtime + FFmpeg + PySide6). O app portátil é gerado pelo GitHub Actions ([build-windows.yml](.github/workflows/build-windows.yml)) com PyInstaller ([packaging/](packaging/)). Veja o [planejamento](docs/ARQUITETURA.md).
+
+### Rodando do código-fonte no Windows
+
+#### 1. Instalar Python, Git e FFmpeg (uma vez)
 
 No PowerShell:
 
@@ -16,7 +32,7 @@ winget install Python.Python.3.12 Git.Git Gyan.FFmpeg
 
 **Feche o terminal e abra um novo** antes de continuar. Sem isso, `git` e `py` não são reconhecidos, porque o PATH só atualiza em terminais novos. Use um PowerShell normal, **não como administrador**, e cole os blocos abaixo um de cada vez.
 
-### 2. Baixar o projeto e criar o ambiente
+#### 2. Baixar o projeto e criar o ambiente
 
 ```powershell
 cd $HOME
@@ -35,15 +51,17 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned   # só na primeira vez
 
 O prompt passa a começar com `(.venv)`. A partir daí, `python` e `pip` são os do ambiente do projeto. Em cada terminal novo, entre na pasta e rode o `Activate.ps1` de novo.
 
-### 3. Instalar o runtime da sua placa (escolha **um**)
+#### 3. Instalar o runtime da sua placa (escolha **um**)
 
 | Sua placa | Comando |
 |---|---|
-| NVIDIA RTX (20/30/40/50) | `pip install -e ".[nvidia,dev]"` |
-| Qualquer outra no Windows: Intel UHD/Iris/Arc, AMD integrada ou RX, GTX 1650/1660 | `pip install -e ".[directml,dev]"` |
-| Sem GPU | `pip install -e ".[cpu,dev]"` |
+| NVIDIA RTX (20/30/40/50) | `pip install -e ".[nvidia,gui,dev]"` |
+| Qualquer outra no Windows: Intel UHD/Iris/Arc, AMD integrada ou RX, GTX 1650/1660 | `pip install -e ".[directml,gui,dev]"` |
+| Sem GPU | `pip install -e ".[cpu,gui,dev]"` |
 
-### 4. Detectar, instalar modelos e medir
+Interface: `python -m gui`. O resto deste guia usa a linha de comando da engine.
+
+#### 4. Detectar, instalar modelos e medir
 
 ```powershell
 python -m engine detect                         # o que foi detectado e qual preset
@@ -55,7 +73,7 @@ python -m engine bench --model realesrgan_x4plus      # modelo pesado
 
 O `bench` mostra quantos frames por segundo a sua máquina processa e estima quanto tempo leva **1 hora de fita**.
 
-### 5. Restaurar um vídeo
+#### 5. Restaurar um vídeo
 
 ```powershell
 python -m engine run "C:\Videos\fita.avi" "C:\Videos\fita_restaurada.mkv"
@@ -69,7 +87,7 @@ Opções úteis:
 - `--model realesrgan_x4plus` escolhe o modelo.
 - Use `.mkv` na saída para copiar o áudio original sem recompressão.
 
-## Presets
+### Presets
 
 | Preset | Exemplo de placa | Runtime | Modelo padrão |
 |---|---|---|---|
@@ -84,7 +102,7 @@ Opções úteis:
 
 Código sob [Apache-2.0](LICENSE). Os pesos dos modelos têm licenças próprias e não fazem parte do repositório; veja [models/README.md](models/README.md).
 
-## Testes
+### Testes
 
 ```bash
 python -m pytest

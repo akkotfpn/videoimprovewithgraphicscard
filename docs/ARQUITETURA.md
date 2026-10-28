@@ -276,15 +276,20 @@ A escolha inicial é uma estimativa. Durante a execução:
 - [ ] SCUNet / FastDVDnet
 - [ ] Benchmark automático: roda 50 frames em cada preset possível e mede fps reais, ajustando a escolha
 
-### Fase 3: interface desktop (3–4 semanas)
-- [ ] Tauri 2 + React em `app/`
-- [ ] Fila de jobs, presets, comparação antes/depois com slider
-- [ ] Instalador de runtime packs (NVIDIA / AMD / Intel / CPU)
-- [ ] Estimativa de tempo e espaço em disco
+### Fase 3: interface desktop e app portátil (antecipada)
+Decisão: **PySide6** em vez de Tauri, para chegar mais cedo a um programa de verdade sem duplicar a stack. A engine continua num processo separado (`videoimprove-cli.exe`), então um travamento do driver não fecha a janela. Tauri continua uma opção futura se o tamanho da interface virar problema.
+- [x] Interface PySide6 (`gui/`): fila com arrastar e soltar, escolha de GPU/qualidade/modelo/ampliação/ruído, 60 fps
+- [x] Prévia antes/depois com divisória arrastável e estimativa de tempo
+- [x] Progresso com tempo restante, cancelar, registro, verificar instalação
+- [x] App portátil: pasta com `VideoImprove.exe`, FFmpeg e modelos embutidos (PyInstaller)
+- [x] Duas variantes: Universal (DirectML, qualquer GPU) e NVIDIA (CUDA/cuDNN embutidos)
+- [x] GitHub Actions: testes no Windows, autoteste do exe, prints da interface, zip na Release
+- [ ] Estimativa de espaço em disco antes de começar
+- [ ] Assinatura de código (evita o aviso do SmartScreen)
 
 ### Fase 4: TensorRT e distribuição (2–3 semanas)
 - [ ] Engines TensorRT FP16 com cache; FP8 experimental
-- [ ] CI no GitHub Actions: testes, build Windows/Linux, release com instaladores
+- [ ] Build Linux (AppImage)
 - [ ] Documentação de usuário e guia de contribuição
 
 ---
@@ -304,10 +309,11 @@ videoimprovewithgraphicscard/
 │   └── stages/
 │       ├── upscale.py       # OnnxUpscale, ResizeUpscale
 │       └── interpolate.py   # contrato de estágio temporal
-├── models/                  # manifesto de modelos (pesos ficam fora do git)
+├── gui/                     # interface PySide6 (janela, prévia, processo da engine)
+├── packaging/               # PyInstaller, ícone, FFmpeg, licenças, LEIA-ME do app
+├── .github/workflows/       # build do app Windows e Release
+├── models/                  # onde os modelos ONNX são gerados (fora do git)
 ├── tests/
-├── tools/                   # exportação de modelos para ONNX (fase 1)
-├── app/                     # UI Tauri + React (fase 3)
 └── docs/
 ```
 
@@ -319,9 +325,14 @@ videoimprovewithgraphicscard/
 
 **Apache-2.0** ou **MIT** para o código. Apache-2.0 tem concessão explícita de patentes, útil num projeto que mexe com codecs e IA. Os pesos dos modelos têm licenças próprias e ficam fora do repositório e do instalador.
 
-### 7.2 Dependências pesadas: "runtime packs"
+### 7.2 Dependências pesadas: variantes do app
 
-O instalador base leva só a UI, a engine congelada, FFmpeg e o runtime de CPU (~150 MB). Na primeira execução, a detecção de hardware sugere o pacote certo:
+Implementado hoje: duas variantes completas, cada uma num zip portátil.
+
+- **Universal**: `onnxruntime-directml`. Funciona em qualquer GPU com DirectX 12 e é a recomendada para PCs medianos.
+- **NVIDIA**: `onnxruntime-gpu` com as DLLs de CUDA e cuDNN dos wheels `nvidia-*`.
+
+Os pacotes `onnxruntime-*` não convivem no mesmo ambiente, por isso são dois zips. Ideia para depois: um app base e "runtime packs" baixados sob demanda:
 
 | Pack | Conteúdo | Tamanho aprox. |
 |---|---|---|
@@ -336,7 +347,8 @@ Os packs ficam numa pasta própria do app, isolados do sistema, sem conflito com
 
 - Build **LGPL** (por exemplo, os builds automáticos do BtbN) pode ir junto com app de qualquer licença.
 - `libx264`/`libx265` exigem build **GPL**. Alternativas sem GPL: NVENC/AMF/QSV (hardware), SVT-AV1 (BSD) e OpenH264 (BSD).
-- Recomendação: build LGPL como padrão e encoder de hardware quando disponível; build GPL como download opcional.
+- Recomendação original: build LGPL como padrão e encoder de hardware quando disponível; build GPL como download opcional.
+- **Implementado:** build **GPL** do BtbN (para ter libx264), distribuído como executável separado em `bin/`, com a licença e o link do código-fonte em `licenses/`. O app só chama o `ffmpeg.exe` como outro programa, sem linkar, então o código do VideoImprove continua Apache-2.0.
 
 ### 7.4 Empacotamento
 
@@ -348,7 +360,7 @@ Os packs ficam numa pasta própria do app, isolados do sistema, sem conflito com
 
 ## 8. Próximos passos sugeridos
 
-1. Rodar `detect`, `models install all` e `bench` no PC com a RTX 5070, com CUDA e também com DirectML (para simular um PC mediano).
-2. Processar um trecho real de VHS digitalizado e comparar `--denoise` 0,3 / 0,5 / 0,8.
-3. RIFE em ONNX e prévia lado a lado.
-4. Escolher entre Tauri e PySide6 para a UI antes da fase 3.
+1. Testar o app portátil na RTX 5070 (zip NVIDIA e Universal) e num PC com vídeo integrado.
+2. Processar um trecho real de VHS digitalizado e calibrar os níveis de ruído.
+3. RIFE em ONNX para o 60 fps de vídeos progressivos.
+4. GFPGAN para rostos (fase 2).
