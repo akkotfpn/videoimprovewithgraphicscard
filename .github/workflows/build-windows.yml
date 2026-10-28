@@ -2,22 +2,27 @@ name: App Windows
 
 # Gera o app portátil (pasta com VideoImprove.exe) em duas variantes e publica os .zip numa Release.
 # - push na main / execução manual: atualiza a pré-release "dev"
-# - tag v*: cria a release da versão
+# - tag v* ou execução manual com "versao": cria a release da versão (a tag é criada pelo GitHub)
 on:
   push:
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      versao:
+        description: "Versão para publicar (ex.: v0.2.0). Vazio = atualizar a pré-release dev"
+        required: false
+        default: ""
 
 permissions:
   contents: write
 
 concurrency:
-  group: app-windows-${{ github.ref }}
+  group: app-windows-${{ inputs.versao || github.ref }}
   cancel-in-progress: true
 
 env:
-  REL: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'dev' }}
+  REL: ${{ inputs.versao || (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || 'dev' }}
 
 jobs:
   release:
@@ -35,7 +40,7 @@ jobs:
               --title "Versão de desenvolvimento (main)" \
               --notes "Build automático do último commit da main ($GITHUB_SHA). Baixe o zip **Universal** (qualquer placa de vídeo) ou **NVIDIA** (RTX/GTX 16), extraia e abra o VideoImprove.exe."
           else
-            gh release view "$REL" >/dev/null 2>&1 || gh release create "$REL" --title "VideoImprove $REL" \
+            gh release view "$REL" >/dev/null 2>&1 || gh release create "$REL" --target "$GITHUB_SHA" --title "VideoImprove $REL" \
               --notes "Baixe o zip **Universal** (qualquer placa de vídeo) ou **NVIDIA** (RTX/GTX 16), extraia e abra o VideoImprove.exe."
           fi
 
