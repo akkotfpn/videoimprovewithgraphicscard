@@ -1,0 +1,31 @@
+[project]
+name = "videoimprove-engine"
+version = "0.1.0"
+description = "Restauração e upscaling de vídeos antigos (VHS) com pipeline adaptativo à GPU"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "pillow>=10",
+    "onnxruntime>=1.18",   # CPU; os packs de GPU substituem por uma das variantes abaixo
+]
+
+[project.optional-dependencies]
+nvidia = ["onnxruntime-gpu>=1.20"]          # CUDA + TensorRT EP
+directml = ["onnxruntime-directml>=1.18"]   # Windows: AMD, Intel, NVIDIA via DX12
+openvino = ["onnxruntime-openvino>=1.18"]   # Intel
+dev = ["pytest>=8", "psutil"]
+
+[project.scripts]
+videoimprove = "engine.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["engine*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
