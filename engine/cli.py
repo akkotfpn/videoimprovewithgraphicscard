@@ -261,7 +261,15 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(name)s: %(message)s", stream=sys.stderr)
-    return args.fn(args)
+    try:
+        return args.fn(args)
+    except (ValueError, FileNotFoundError, RuntimeError) as e:
+        if args.verbose:
+            raise
+        if getattr(args, "json", False):
+            print(json.dumps({"event": "error", "message": str(e)}, ensure_ascii=False), flush=True)
+        print(f"erro: {e}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
