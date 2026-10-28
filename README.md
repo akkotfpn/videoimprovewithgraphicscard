@@ -14,18 +14,26 @@ No PowerShell:
 winget install Python.Python.3.12 Git.Git Gyan.FFmpeg
 ```
 
-Feche e abra o terminal de novo para o PATH atualizar.
+**Feche o terminal e abra um novo** antes de continuar. Sem isso, `git` e `py` não são reconhecidos, porque o PATH só atualiza em terminais novos. Use um PowerShell normal, **não como administrador**, e cole os blocos abaixo um de cada vez.
 
 ### 2. Baixar o projeto e criar o ambiente
 
 ```powershell
+cd $HOME
 git clone https://github.com/akkotfpn/videoimprovewithgraphicscard.git
 cd videoimprovewithgraphicscard
 py -3.12 -m venv .venv
+```
+
+Se o `py` não for reconhecido mesmo no terminal novo, use o caminho completo:
+`& "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" -m venv .venv`
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned   # só na primeira vez
 .venv\Scripts\Activate.ps1
 ```
 
-Se o PowerShell bloquear o `Activate.ps1`, rode uma vez: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+O prompt passa a começar com `(.venv)`. A partir daí, `python` e `pip` são os do ambiente do projeto. Em cada terminal novo, entre na pasta e rode o `Activate.ps1` de novo.
 
 ### 3. Instalar o runtime da sua placa (escolha **um**)
 
