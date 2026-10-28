@@ -122,6 +122,7 @@ class HardwareProfile:
     ort_providers: list[str] = field(default_factory=list)
     vulkan_available: bool = False
     ffmpeg_hwaccels: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)   # avisos da detecção (vão para os motivos do plano)
 
     @property
     def best_gpu(self) -> GPUInfo | None:
@@ -296,6 +297,35 @@ def probe_onnxruntime() -> list[str]:
         return []
 
 
+def probe_tensorrt() -> bool:
+    """
+    O ONNX Runtime lista o TensorrtExecutionProvider mesmo sem as DLLs do TensorRT instaladas;
+    aí a sessão falha ou cai para CUDA. Aqui conferimos se a biblioteca carrega de verdade.
+    Aceita TensorRT no PATH ou o pacote pip `tensorrt` (pasta tensorrt_libs).
+    """
+    import ctypes
+    import ctypes.util
+    try:
+        import tensorrt_libs  # pacote pip tensorrt-cu12/cu13
+        libdir = os.path.dirname(tensorrt_libs.__file__)
+        os.environ["PATH"] = libdir + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(libdir)
+    except ImportError:
+        pass
+    names = ["nvinfer_10", "nvinfer"] if platform.system() == "Windows" else ["nvinfer"]
+    for n in names:
+        path = ctypes.util.find_library(n)
+        if not path:
+            continue
+        try:
+            ctypes.CDLL(path)
+            return True
+        except OSError:
+            continue
+    return False
+
+
 def probe_ffmpeg_hwaccels() -> list[str]:
     out = _run(["ffmpeg", "-hide_banner", "-hwaccels"])
     return [l.strip() for l in out.splitlines()[1:] if l.strip()]
@@ -308,6 +338,11 @@ def detect_hardware() -> HardwareProfile:
     probe_rocm_smi(gpus)
     probe_windows(gpus)
     vulkan = probe_vulkan(gpus)
+    providers = probe_onnxruntime()
+    notes: list[str] = []
+    if "TensorrtExecutionProvider" in providers and not probe_tensorrt():
+        providers.remove("TensorrtExecutionProvider")
+        notes.append("TensorRT não instalado (só o provider do ONNX Runtime): usando CUDA")
     return HardwareProfile(
         os=f"{platform.system()} {platform.release()}",
         cpu=platform.processor() or platform.machine(),
@@ -315,9 +350,10 @@ def detect_hardware() -> HardwareProfile:
         ram_mb=_ram_mb(),
         gpus=gpus,
         torch_backend=torch_backend,
-        ort_providers=probe_onnxruntime(),
+        ort_providers=providers,
         vulkan_available=vulkan,
         ffmpeg_hwaccels=probe_ffmpeg_hwaccels(),
+        notes=notes,
     )
 
 
@@ -342,14 +378,20 @@ class ExecutionPlan:
         return json.dumps(asdict(self), indent=2, ensure_ascii=False, default=str)
 
 
-def choose_plan(hw: HardwareProfile, force: Preset | None = None) -> ExecutionPlan:
+def choose_plan(hw: HardwareProfile, force: Preset | None = None, gpu_index: int | None = None) -> ExecutionPlan:
     """
     Meta do projeto: qualquer PC mediano tem que conseguir restaurar (GTX 1660, Intel Iris Xe,
     AMD Radeon 680M/780M). Por isso o Econômico é um caminho de primeira classe, não um "modo de pena":
     mesmo modelo de IA (compact), só que com tiles menores e sem os estágios caros.
     """
-    g = hw.best_gpu
-    why: list[str] = []
+    why: list[str] = list(hw.notes)
+    if gpu_index is not None:
+        if not 0 <= gpu_index < len(hw.gpus):
+            raise ValueError(f"GPU {gpu_index} não existe; detectadas: {len(hw.gpus)}")
+        g = hw.gpus[gpu_index]
+        why.append(f"GPU escolhida pelo usuário: {g.name}")
+    else:
+        g = hw.best_gpu
     ort = set(hw.ort_providers)
     vram = g.effective_vram_mb(hw.ram_mb) if g else 0
     if g and g.integrated:
@@ -396,6 +438,8 @@ def choose_plan(hw: HardwareProfile, force: Preset | None = None) -> ExecutionPl
         backend = Backend.DIRECTML
     elif hw.vulkan_available and g:
         backend = Backend.NCNN_VULKAN
+        why.append("estágio NCNN-Vulkan ainda não implementado: a IA roda na CPU. "
+                   "No Windows, instale o runtime directml para usar esta GPU")
     else:
         backend = Backend.CPU
         if g and preset != Preset.CPU:
@@ -411,7 +455,8 @@ def choose_plan(hw: HardwareProfile, force: Preset | None = None) -> ExecutionPl
 
     # ---------- parâmetros por preset ----------
     table = {
-        Preset.ULTRA: dict(precision="fp8" if backend == Backend.TENSORRT else "fp16",
+        # FP8 é meta (precisa de quantização calibrada e validação de qualidade); hoje roda FP16
+        Preset.ULTRA: dict(precision="fp16",
                            tile=0 if vram >= 16_000 else 768, batch=8,
                            sr="realbasicvsr_x4", face="codeformer", interp="rife_v4",
                            denoise="scunet"),

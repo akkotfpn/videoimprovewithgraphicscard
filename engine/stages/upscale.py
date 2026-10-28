@@ -79,9 +79,14 @@ class OnnxUpscale:
             raise ValueError(f"modelo é {self.model_scale}x; não dá para gerar {self.scale}x com ele")
 
     def _probe_scale(self) -> int:
-        """Descobre o fator nativo do modelo rodando uma entrada 8x8."""
+        """
+        Descobre o fator nativo do modelo rodando uma entrada 8x8 numa sessão de CPU separada.
+        Na GPU isso faria o TensorRT compilar um engine inteiro só para o formato 8x8.
+        """
+        import onnxruntime as ort
+        probe = ort.InferenceSession(str(self.model_path), providers=["CPUExecutionProvider"])
         x = np.zeros((1, 3, 8, 8), dtype=self.dtype)
-        y = self.session.run(None, {self.input_name: x})[0]
+        y = probe.run(None, {probe.get_inputs()[0].name: x})[0]
         return int(y.shape[-1] // 8)
 
     @staticmethod
@@ -120,6 +125,8 @@ class OnnxUpscale:
                 }))
             elif p in ("CUDAExecutionProvider", "ROCMExecutionProvider"):
                 providers.append((p, {"device_id": device_id, "cudnn_conv_algo_search": "HEURISTIC"}))
+            elif p == "DmlExecutionProvider":
+                providers.append((p, {"device_id": device_id}))
             else:
                 providers.append(p)
         providers.append("CPUExecutionProvider")

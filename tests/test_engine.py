@@ -22,7 +22,7 @@ def hw(gpu=None, ort=(), vulkan=False, torch=None, hwaccels=()):
 def test_rtx5090_tensorrt_is_ultra_fp8():
     g = GPUInfo("NVIDIA GeForce RTX 5090", Vendor.NVIDIA, 32607, (12, 0))
     p = choose_plan(hw(g, ["TensorrtExecutionProvider", "CUDAExecutionProvider"], hwaccels=["cuda"]))
-    assert (p.preset, p.backend, p.precision, p.tile_size) == (Preset.ULTRA, Backend.TENSORRT, "fp8", 0)
+    assert (p.preset, p.backend, p.precision, p.tile_size) == (Preset.ULTRA, Backend.TENSORRT, "fp16", 0)
     assert g.arch == "Blackwell (RTX 50)" and p.nvenc
 
 
@@ -301,3 +301,50 @@ def test_catalog_install_from_local_weights(tmp_path):
     st = OnnxUpscale(out[0], 2, Backend.CPU, tile=0)
     assert st.model_scale == 4
     assert st.process(_frames(1, 24, 32)).shape == (1, 48, 64, 3)
+
+
+
+# ---------------- PC real do desenvolvedor: RTX 5070 + Radeon integrada do Ryzen ----------------
+def _dev_pc(providers):
+    h = hw(None, providers, vulkan=True, hwaccels=["cuda"])
+    h.gpus = [GPUInfo("NVIDIA GeForce RTX 5070", Vendor.NVIDIA, 12227, (12, 0)),
+              GPUInfo("AMD Radeon(TM) Graphics", Vendor.AMD, 512)]
+    h.ram_mb = 31830
+    return h
+
+
+def test_dev_pc_defaults_to_5070():
+    p = choose_plan(_dev_pc(["CUDAExecutionProvider"]))
+    assert p.preset == Preset.ULTRA and p.backend == Backend.CUDA
+
+
+def test_dev_pc_igpu_via_directml_simulates_mid_range_pc():
+    p = choose_plan(_dev_pc(["DmlExecutionProvider"]), gpu_index=1)
+    assert p.preset == Preset.ECONOMICO and p.backend == Backend.DIRECTML
+    assert p.sr_model == "realesr_general_x4v3"
+
+
+def test_dev_pc_igpu_without_directml_warns_about_ncnn():
+    p = choose_plan(_dev_pc(["CUDAExecutionProvider"]), gpu_index=1)
+    assert p.backend == Backend.NCNN_VULKAN
+    assert any("NCNN" in r for r in p.reasons)
+
+
+def test_invalid_gpu_index():
+    with pytest.raises(ValueError):
+        choose_plan(_dev_pc([]), gpu_index=5)
+
+
+def test_hardware_notes_flow_into_plan_reasons():
+    h = _dev_pc(["CUDAExecutionProvider"])
+    h.notes = ["TensorRT não instalado"]
+    assert "TensorRT não instalado" in choose_plan(h).reasons
+
+
+def test_ultra_without_realbasicvsr_falls_back_to_x4plus(tmp_path, monkeypatch):
+    from engine import cli
+    (tmp_path / "realesrgan_x4plus.onnx").write_bytes(b"x")
+    (tmp_path / "realesr_general_x4v3.onnx").write_bytes(b"x")
+    monkeypatch.setenv("VIDEOIMPROVE_MODELS", str(tmp_path))
+    p = choose_plan(_dev_pc(["CUDAExecutionProvider"]))
+    assert cli.resolve_model(None, p).name.startswith("realesrgan_x4plus")

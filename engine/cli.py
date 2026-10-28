@@ -55,13 +55,17 @@ def resolve_model(requested: str | None, plan) -> Path | None:
         return p
     if plan.sr_model == "classico":
         return None
-    for key in dict.fromkeys([plan.sr_model, "realesr_general_x4v3"]):
+    chain = [plan.sr_model]
+    if plan.preset in (Preset.ULTRA, Preset.EQUILIBRADO):
+        chain.append("realesrgan_x4plus")  # RealBasicVSR ainda não existe: o pesado disponível
+    chain.append("realesr_general_x4v3")
+    for key in dict.fromkeys(chain):
         if key in catalog.CATALOG and (p := catalog.find(key, prefer_fp16)):
             return p
     return None
 
 
-def build_sr_stage(requested: str | None, scale: int, plan):
+def build_sr_stage(requested: str | None, scale: int, plan, device: int = 0):
     log = logging.getLogger("restaura")
     path = resolve_model(requested, plan)
     if path is None:
@@ -72,7 +76,7 @@ def build_sr_stage(requested: str | None, scale: int, plan):
             log.warning("nenhum modelo de IA instalado: usando redimensionamento clássico. "
                         "Instale com: python -m engine models install realesr_general_x4v3")
         return ResizeUpscale(scale)
-    return OnnxUpscale(path, scale, plan.backend, tile=plan.tile_size)
+    return OnnxUpscale(path, scale, plan.backend, tile=plan.tile_size, device_id=device)
 
 
 def cmd_models(args) -> int:
@@ -95,19 +99,24 @@ def cmd_models(args) -> int:
 
 def cmd_detect(args) -> int:
     hw = detect_hardware()
-    plan = choose_plan(hw, Preset(args.preset) if args.preset else None)
+    plan = choose_plan(hw, Preset(args.preset) if args.preset else None, args.gpu)
     if args.json:
         print(json.dumps({"hardware": json.loads(hw.to_json()), "plan": json.loads(plan.to_json())},
                          ensure_ascii=False))
     else:
         print(hw.to_json()); print(plan.to_json())
+        if len(hw.gpus) > 1:
+            print("\nGPUs (use --gpu N para escolher outra):", file=sys.stderr)
+            for i, g in enumerate(hw.gpus):
+                kind = "integrada" if g.integrated else "dedicada"
+                print(f"  {i}: {g.name} ({kind})", file=sys.stderr)
     return 0
 
 
 def cmd_run(args) -> int:
     require_ffmpeg()
     hw = detect_hardware()
-    plan = choose_plan(hw, Preset(args.preset) if args.preset else None)
+    plan = choose_plan(hw, Preset(args.preset) if args.preset else None, args.gpu)
     if args.tile is not None:
         plan.tile_size = args.tile
     log = logging.getLogger("restaura")
@@ -115,7 +124,7 @@ def cmd_run(args) -> int:
              plan.precision, plan.tile_size, "; ".join(plan.reasons))
 
     stages = []
-    sr = build_sr_stage(args.model, args.scale, plan) if args.scale > 1 else None
+    sr = build_sr_stage(args.model, args.scale, plan, args.device) if args.scale > 1 else None
     if sr:
         stages.append(sr)
     if args.interpolate:
@@ -164,10 +173,10 @@ def cmd_bench(args) -> int:
     import numpy as np
 
     hw = detect_hardware()
-    plan = choose_plan(hw, Preset(args.preset) if args.preset else None)
+    plan = choose_plan(hw, Preset(args.preset) if args.preset else None, args.gpu)
     if args.tile is not None:
         plan.tile_size = args.tile
-    st = build_sr_stage(args.model, args.scale, plan)
+    st = build_sr_stage(args.model, args.scale, plan, args.device)
     if isinstance(st, OnnxUpscale):
         label = f"{st.model_path.name} via {st.session.get_providers()[0]} ({st.dtype.__name__})"
     else:
@@ -186,7 +195,7 @@ def cmd_bench(args) -> int:
     fps = n / (time.perf_counter() - t0)
     hours = 3600 * 29.97 / fps / 3600
 
-    g = hw.best_gpu
+    g = hw.gpus[args.gpu] if args.gpu is not None else hw.best_gpu
     result = {
         "gpu": g.name if g else "CPU", "preset": plan.preset.value, "backend": plan.backend.value,
         "estagio": label, "tile": plan.tile_size, "escala": args.scale,
@@ -211,6 +220,7 @@ def main(argv=None) -> int:
     d = sub.add_parser("detect", help="detecta hardware e mostra o plano")
     d.add_argument("--preset", choices=[x.value for x in Preset])
     d.add_argument("--json", action="store_true")
+    d.add_argument("--gpu", type=int, help="índice da GPU (veja 'detect') para montar o plano")
     d.set_defaults(fn=cmd_detect)
 
     r = sub.add_parser("run", help="processa um vídeo")
@@ -225,6 +235,9 @@ def main(argv=None) -> int:
     r.add_argument("--encoder", default="auto")
     r.add_argument("--crf", type=int, default=18)
     r.add_argument("--json", action="store_true", help="eventos JSON no stdout (para a UI)")
+    r.add_argument("--gpu", type=int, help="índice da GPU (veja 'detect') para montar o plano")
+    r.add_argument("--device", type=int, default=0,
+                   help="índice do adaptador no runtime (CUDA/DirectML). No DirectML segue a ordem do Windows")
     r.set_defaults(fn=cmd_run)
 
     m = sub.add_parser("models", help="lista ou instala modelos de IA (converte para ONNX, sem PyTorch)")
@@ -240,6 +253,9 @@ def main(argv=None) -> int:
     b.add_argument("--tile", type=int)
     b.add_argument("--seconds", type=float, default=15)
     b.add_argument("--json", action="store_true")
+    b.add_argument("--gpu", type=int, help="índice da GPU (veja 'detect') para montar o plano")
+    b.add_argument("--device", type=int, default=0,
+                   help="índice do adaptador no runtime (CUDA/DirectML). No DirectML segue a ordem do Windows")
     b.set_defaults(fn=cmd_bench)
 
     args = p.parse_args(argv)
