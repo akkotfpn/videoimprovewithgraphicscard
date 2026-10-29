@@ -364,3 +364,37 @@ Os packs ficam numa pasta própria do app, isolados do sistema, sem conflito com
 2. Processar um trecho real de VHS digitalizado e calibrar os níveis de ruído.
 3. RIFE em ONNX para o 60 fps de vídeos progressivos.
 4. GFPGAN para rostos (fase 2).
+
+
+---
+
+## 9. Desempenho (v0.3)
+
+Diagnóstico do primeiro teste real (RTX 5070, vídeo 1920×1080, 0,2 quadro/s, estimativa de 169 h):
+
+| Problema | Causa | Correção |
+|---|---|---|
+| Modelo pesado demais | O preset Ultra escolhia o Real-ESRGAN x4plus sem olhar a resolução. São 17,9 M multiplicações por pixel de entrada: **74 TFLOP por quadro** em 1080p. | `engine/core/adapt.py` escolhe o modelo pela velocidade estimada (custo do modelo × pixels de entrada × desempenho da GPU). Novo **x2plus**: 2× nativo, corpo em 1/4 dos pixels, ~4× mais leve que o x4plus. |
+| GPU parada esperando a CPU ("dente de serra") | O modelo 4× gerava a imagem em 8K como float32 (400 MB por quadro). A CPU fazia clip, ×255, conversão e Lanczos 8K→4K: **~1 s por quadro** com a GPU ociosa. | Os modelos recebem e devolvem **uint8**. Conversão, normalização, redução 4×→2× (média 2×2, exata) e arredondamento rodam **dentro do grafo, na GPU**. A CPU só copia bytes. |
+| Um bloco por chamada | Cada quadro era cortado em blocos e cada bloco ia numa chamada separada. | **Lote**: quadros inteiros (ou blocos) agrupados numa chamada, dentro de um orçamento de memória (60% da VRAM ÷ custo de memória do modelo). Sem VRAM, o orçamento cai pela metade e a chamada é refeita. |
+| VRAM no limite | A arena do ONNX Runtime crescia sem teto. | `gpu_mem_limit` em 85% da VRAM e `arena_extend_strategy=kSameAsRequested`. |
+| Vídeo de fita salvo em 1080p | O detalhe real é de SD, mas a IA processava 2 MP por quadro. | **Resolução de trabalho**: mede o detalhe acima da meia resolução (PSNR de reduzir e voltar). Acima de 40 dB, a IA roda em meia resolução e amplia 4×. |
+| Encoder na CPU (AMD/Intel) | libx264 `medium` em 4K. | NVENC/AMF/QSV quando funcionam (testa 1 quadro antes); x264 `fast` como reserva. |
+
+Equivalentes no ONNX Runtime das otimizações típicas de PyTorch (o app não usa PyTorch, para ser portátil):
+
+| PyTorch | Aqui |
+|---|---|
+| `model.half()` / `autocast` | modelos `.fp16.onnx`, com troca automática para FP32 se a GPU gerar NaN (saída `nonfinite` do grafo) |
+| `torch.backends.cudnn.benchmark = True` | `cudnn_conv_algo_search=EXHAUSTIVE` (os formatos de entrada são fixos por vídeo, então a busca é feita uma vez) |
+| channels-last | `prefer_nhwc=1` |
+| `torch.compile` | TensorRT Execution Provider (próximo passo: exige as DLLs do TensorRT, ~1 GB) |
+| NVDEC | `-hwaccel cuda` no FFmpeg (cai sozinho para software se o codec não for suportado) |
+
+Custo por quadro (multiplicações × 2):
+
+| Modelo | M MAC/pixel | 1080p | 540p | 480p (VHS) |
+|---|---|---|---|---|
+| x4plus | 17,9 | 74 TFLOP | 18,5 | 12,4 |
+| x2plus | 4,5 | 18,5 | 4,6 | 3,1 |
+| compact | 1,2 | 4,9 | 1,2 | 0,8 |

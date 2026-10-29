@@ -32,6 +32,15 @@ def blend(sd_a: dict, sd_b: dict, alpha: float) -> dict:
     return {k: alpha * sd_a[k] + (1 - alpha) * sd_b[k] for k in sd_a}
 
 
+def model_info(sd: dict) -> tuple[str, int]:
+    """(arquitetura, escala nativa)."""
+    arch = detect_arch(sd)
+    if arch == "srvgg_compact":
+        return arch, _compact_layers(sd)[2]
+    in_ch = sd["conv_first.weight"].shape[1]
+    return arch, {3: 4, 12: 2, 48: 1}[in_ch]  # RRDBNet x2/x1 usam pixel_unshuffle na entrada
+
+
 # ---------------- SRVGGNetCompact ----------------
 def _compact_layers(sd):
     idx = sorted({int(m.group(1)) for k in sd if (m := re.match(r"body\.(\d+)\.", k))})
@@ -40,10 +49,10 @@ def _compact_layers(sd):
     return idx, last, scale
 
 
-def export_compact(sd: dict, path: str | Path, fp16: bool = False) -> int:
+def export_compact(sd: dict, path: str | Path, fp16: bool = False, uint8_io: bool = True) -> int:
     idx, last, scale = _compact_layers(sd)
     g = GraphBuilder(fp16)
-    x = "input"
+    x = g.uint8_input() if uint8_io else "input"
     h = x
     for i in idx:
         w = sd[f"body.{i}.weight"]
@@ -53,7 +62,10 @@ def export_compact(sd: dict, path: str | Path, fp16: bool = False) -> int:
             h = g.prelu(h, w, f"body.{i}.weight")
     h = g.pixel_shuffle(h, scale)
     y = g.add(h, g.upsample_nearest(x, scale))
-    g.save(path, x, y)
+    if uint8_io:
+        g.save_uint8(path, y, scale)
+    else:
+        g.save(path, x, y)
     return scale
 
 
@@ -82,11 +94,14 @@ def run_compact_numpy(sd: dict, img: np.ndarray) -> np.ndarray:
 
 
 # ---------------- RRDBNet ----------------
-def export_rrdbnet(sd: dict, path: str | Path, fp16: bool = False) -> int:
+def export_rrdbnet(sd: dict, path: str | Path, fp16: bool = False, uint8_io: bool = True) -> int:
+    _, scale = model_info(sd)
     g = GraphBuilder(fp16)
     c = lambda x, name: g.conv(x, sd[name + ".weight"], sd[name + ".bias"], name)  # noqa: E731
-    x = "input"
-    feat = c(x, "conv_first")
+    x = g.uint8_input() if uint8_io else "input"
+    # x2plus: o corpo roda em 1/4 dos pixels (pixel_unshuffle 2x), por isso é ~4x mais leve que o x4plus
+    first_in = x if scale == 4 else g.pixel_unshuffle(x, 4 // scale)
+    feat = c(first_in, "conv_first")
     n_blocks = 1 + max(int(m.group(1)) for k in sd if (m := re.match(r"body\.(\d+)\.rdb", k)))
     body = feat
     for b in range(n_blocks):
@@ -103,10 +118,50 @@ def export_rrdbnet(sd: dict, path: str | Path, fp16: bool = False) -> int:
     feat = g.lrelu(c(g.upsample_nearest(feat, 2), "conv_up1"))
     feat = g.lrelu(c(g.upsample_nearest(feat, 2), "conv_up2"))
     y = c(g.lrelu(c(feat, "conv_hr")), "conv_last")
-    g.save(path, x, y)
-    return 4
+    if uint8_io:
+        g.save_uint8(path, y, scale)
+    else:
+        g.save(path, x, y)
+    return scale
 
 
-def export(sd: dict, path: str | Path, fp16: bool = False) -> int:
+def export(sd: dict, path: str | Path, fp16: bool = False, uint8_io: bool = True) -> int:
     arch = detect_arch(sd)
-    return (export_compact if arch == "srvgg_compact" else export_rrdbnet)(sd, path, fp16)
+    return (export_compact if arch == "srvgg_compact" else export_rrdbnet)(sd, path, fp16, uint8_io)
+
+
+# ---------------- referência NumPy do RRDBNet (validação, só para entradas minúsculas) ----------------
+def _conv_np(x, w, b):
+    c, hh, ww = x.shape
+    k = w.shape[-1]
+    p = np.pad(x, ((0, 0), (k // 2, k // 2), (k // 2, k // 2)))
+    cols = np.stack([p[:, i:i + hh, j:j + ww] for i in range(k) for j in range(k)], 1).reshape(c, k, k, hh, ww)
+    return np.einsum("ocij,cijhw->ohw", w, cols) + b[:, None, None]
+
+
+def run_rrdbnet_numpy(sd: dict, img: np.ndarray) -> np.ndarray:
+    _, scale = model_info(sd)
+    lr = lambda v: np.where(v >= 0, v, 0.2 * v)  # noqa: E731
+    c = lambda v, n: _conv_np(v, sd[n + ".weight"], sd[n + ".bias"])  # noqa: E731
+    x = img
+    if scale < 4:
+        r = 4 // scale
+        ch, hh, ww = x.shape
+        x = x.reshape(ch, hh // r, r, ww // r, r).transpose(0, 2, 4, 1, 3).reshape(ch * r * r, hh // r, ww // r)
+    feat = c(x, "conv_first")
+    n_blocks = 1 + max(int(m.group(1)) for k in sd if (m := re.match(r"body\.(\d+)\.rdb", k)))
+    body = feat
+    for b in range(n_blocks):
+        block_in = body
+        for r_ in (1, 2, 3):
+            p = f"body.{b}.rdb{r_}"
+            feats = [body]
+            for k in range(1, 5):
+                feats.append(lr(c(np.concatenate(feats, 0), f"{p}.conv{k}")))
+            body = c(np.concatenate(feats, 0), f"{p}.conv5") * 0.2 + body
+        body = body * 0.2 + block_in
+    feat = feat + c(body, "conv_body")
+    up = lambda v: v.repeat(2, 1).repeat(2, 2)  # noqa: E731
+    feat = lr(c(up(feat), "conv_up1"))
+    feat = lr(c(up(feat), "conv_up2"))
+    return c(lr(c(feat, "conv_hr")), "conv_last")

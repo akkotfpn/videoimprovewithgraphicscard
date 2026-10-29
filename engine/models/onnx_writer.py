@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-FLOAT, INT64, FLOAT16 = 1, 7, 10
+FLOAT, UINT8, INT64, FLOAT16 = 1, 2, 7, 10
 _ATTR_FLOAT, _ATTR_INT, _ATTR_STRING, _ATTR_INTS = 1, 2, 3, 7
 
 
@@ -51,7 +51,7 @@ def _bytes(field: int, b: bytes | str) -> bytes:
 # ---------------- mensagens ONNX ----------------
 def tensor(name: str, arr: np.ndarray) -> bytes:
     arr = np.ascontiguousarray(arr)
-    dtype = {np.float32: FLOAT, np.float16: FLOAT16, np.int64: INT64}[arr.dtype.type]
+    dtype = {np.float32: FLOAT, np.float16: FLOAT16, np.int64: INT64, np.uint8: UINT8}[arr.dtype.type]
     return (b"".join(_int(1, d) for d in arr.shape) + _int(2, dtype) + _bytes(8, name)
             + _bytes(9, arr.astype(arr.dtype.newbyteorder("<")).tobytes()))
 
@@ -147,6 +147,65 @@ class GraphBuilder:
             self._consts[key] = key
         return self.op("Resize", [x, "", key], mode="nearest")
 
+    # ---------- entrada/saída em uint8 (formato do app) ----------
+    def raw(self, name: str, arr: np.ndarray) -> str:
+        """Inicializador com o dtype do próprio array (não converte para o dtype do modelo)."""
+        self.inits.append(tensor(name, np.ascontiguousarray(arr)))
+        return name
+
+    def pixel_unshuffle(self, x: str, r: int, channels: int = 3) -> str:
+        """
+        = torch.nn.functional.pixel_unshuffle. O SpaceToDepth do ONNX usa a ordem (bloco, canal);
+        o PyTorch usa (canal, bloco). Um Gather constante no eixo dos canais reordena.
+        """
+        y = self.op("SpaceToDepth", [x], blocksize=r)
+        idx = []
+        for k in range(channels * r * r):
+            c, rest = divmod(k, r * r)
+            bh, bw = divmod(rest, r)
+            idx.append((bh * r + bw) * channels + c)
+        return self.op("Gather", [y, self.raw(self._name("unshuffle_idx"), np.array(idx, np.int64))], axis=1)
+
+    def uint8_input(self) -> str:
+        """
+        Entrada `frames`: uint8 [lote, altura, largura, 3] (RGB, como sai do FFmpeg).
+        Converte na GPU para NCHW em [0,1] no dtype do modelo.
+        """
+        x = self.op("Cast", ["frames"], to=FLOAT16 if self.fp16 else FLOAT)
+        x = self.op("Transpose", [x], perm=[0, 3, 1, 2])
+        return self.scale(x, 1.0 / 255.0)
+
+    def save_uint8(self, path: str | Path, y: str, model_scale: int) -> None:
+        """
+        Saída `out`: uint8 [lote, altura*s, largura*s, 3], onde s = model_scale * out_scale.
+        `out_scale` (float32 [4] = [1, 1, f, f]) é uma entrada: f=1 mantém a escala do modelo,
+        f=0,5 reduz pela metade (modelo 4x -> saída 2x). Com half_pixel e interpolação linear,
+        f=0,5 é exatamente a média de cada bloco 2x2, ou seja, um filtro de área sem aliasing.
+        Tudo roda na GPU: a CPU só copia bytes.
+        """
+        outputs = [value_info("out", UINT8, ["batch", "out_height", "out_width", 3])]
+        if self.fp16:
+            # GPUs sem Tensor Cores (GTX 16) às vezes estouram em FP16: a engine olha esta saída
+            # e troca para o modelo FP32 se ela vier > 0
+            # y - y é 0 para valores finitos e NaN para NaN/inf; a soma propaga o NaN.
+            # (IsInf não aceita float16 no opset 17; assim também evita criar um tensor float32 enorme)
+            total = self.op("ReduceSum", [self.op("Sub", [y, y])], keepdims=0)
+            bad = self.op("IsNaN", [self.op("Cast", [total], to=FLOAT)])
+            self.nodes.append(node("Cast", [bad], ["nonfinite"], to=FLOAT))
+            outputs.append(value_info("nonfinite", FLOAT, []))
+        y = self.op("Resize", [y, "", "out_scale"], mode="linear",
+                    coordinate_transformation_mode="half_pixel")
+        y = self.scale(y, 255.0)
+        y = self.op("Clip", [y, self.const(0.0), self.const(255.0)])
+        y = self.op("Round", [y])
+        y = self.op("Cast", [y], to=UINT8)
+        self.nodes.append(node("Transpose", [y], ["out"], perm=[0, 2, 3, 1]))
+        data = model(self.nodes, self.inits,
+                     [value_info("frames", UINT8, ["batch", "height", "width", 3]),
+                      value_info("out_scale", FLOAT, [4])],
+                     outputs, producer=f"videoimprove-u8-x{model_scale}")
+        Path(path).write_bytes(data)
+
     def save(self, path: str | Path, x: str, y: str) -> None:
         elem = FLOAT16 if self.fp16 else FLOAT
         self.nodes.append(node("Identity", [y], ["output"]))
@@ -171,3 +230,13 @@ def sr_model(path, scale: int, fp16: bool = False, broken: bool = False) -> None
     g.nodes.append(node("Identity", [cur], ["y"]))
     Path(path).write_bytes(model(g.nodes, g.inits, [value_info("x", elem, [1, 3, "h", "w"])],
                                  [value_info("y", elem, [1, 3, "H", "W"])]))
+
+
+def sr_model_u8(path, scale: int, fp16: bool = False, broken: bool = False) -> None:
+    """Modelo de teste no formato do app (uint8): nearest. broken=True gera inf (simula FP16 estourando)."""
+    g = GraphBuilder(fp16=fp16)
+    x = g.uint8_input()
+    y = g.upsample_nearest(x, scale)
+    if broken:
+        y = g.op("Div", [y, g.const(0.0)])
+    g.save_uint8(path, y, scale)

@@ -271,7 +271,7 @@ def test_compact_onnx_matches_numpy_reference(tmp_path):
     import onnxruntime as ort
     sd = state_dict(WEIGHTS / "realesr-general-x4v3.pth")
     assert realesrgan.detect_arch(sd) == "srvgg_compact"
-    realesrgan.export(sd, tmp_path / "c.onnx")
+    realesrgan.export(sd, tmp_path / "c.onnx", uint8_io=False)
     img = np.random.default_rng(0).random((3, 10, 12), dtype=np.float32)
     sess = ort.InferenceSession(str(tmp_path / "c.onnx"), providers=["CPUExecutionProvider"])
     y = sess.run(None, {"input": img[None]})[0][0]
@@ -284,7 +284,7 @@ def test_rrdbnet_exports_and_upscales(tmp_path):
     import onnxruntime as ort
     sd = state_dict(WEIGHTS / "RealESRGAN_x4plus.pth")
     assert realesrgan.detect_arch(sd) == "rrdbnet"
-    realesrgan.export(sd, tmp_path / "x.onnx")
+    realesrgan.export(sd, tmp_path / "x.onnx", uint8_io=False)
     yy, xx = np.mgrid[0:24, 0:24] / 24.0
     img = (np.stack([np.sin(3 * xx), np.cos(2 * yy), xx * yy]) * 0.4 + 0.5).astype(np.float32)
     y = ort.InferenceSession(str(tmp_path / "x.onnx"), providers=["CPUExecutionProvider"]).run(
@@ -341,13 +341,11 @@ def test_hardware_notes_flow_into_plan_reasons():
     assert "TensorRT não instalado" in choose_plan(h).reasons
 
 
-def test_ultra_without_realbasicvsr_falls_back_to_x4plus(tmp_path, monkeypatch):
-    from engine import cli
-    (tmp_path / "realesrgan_x4plus.onnx").write_bytes(b"x")
-    (tmp_path / "realesr_general_x4v3.onnx").write_bytes(b"x")
-    monkeypatch.setenv("VIDEOIMPROVE_MODELS", str(tmp_path))
+def test_ultra_on_vhs_2x_picks_x2plus():
+    from engine.core.adapt import choose_job
     p = choose_plan(_dev_pc(["CUDAExecutionProvider"]))
-    assert cli.resolve_model(None, p).name.startswith("realesrgan_x4plus")
+    job = choose_job(p, 720, 480, 2, work="original")
+    assert job.model == "realesrgan_x2plus" and (job.out_w, job.out_h) == (1440, 960)
 
 
 # ---------------- app: 60 fps por campo, prévia, autoteste ----------------

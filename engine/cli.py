@@ -61,49 +61,91 @@ def make_plan(args, hw=None):
 def _encoder_available(name: str) -> bool:
     if not shutil.which("ffmpeg"):
         return False
-    out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
+    out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True,
+                         creationflags=paths.no_window_flags()).stdout
     return f" {name} " in out
 
 
-def resolve_model(requested: str | None, plan) -> Path | None:
-    """
-    Escolhe o arquivo ONNX: o pedido pelo usuário (caminho ou nome do catálogo) ou, sem pedido,
-    o modelo do preset; se ele não estiver instalado, cai para o compact.
-    FP16 só em GPU (na CPU é mais lento e pode nem ter kernel).
-    """
-    prefer_fp16 = plan.backend != Backend.CPU and plan.precision != "fp32"
-    if requested:
-        p = catalog.find(requested, prefer_fp16)
-        if p and not prefer_fp16 and ".fp16" in p.name:
-            p = OnnxUpscale.fp32_sibling(p) or p
-        if p is None:
-            raise FileNotFoundError(f"modelo não encontrado: {requested} "
-                                    f"(instale com: python -m engine models install {requested})")
-        return p
-    if plan.sr_model == "classico":
-        return None
-    chain = [plan.sr_model]
-    if plan.preset in (Preset.ULTRA, Preset.EQUILIBRADO):
-        chain.append("realesrgan_x4plus")  # RealBasicVSR ainda não existe: o pesado disponível
-    chain.append("realesr_general_x4v3")
-    for key in dict.fromkeys(chain):
-        if key in catalog.CATALOG and (p := catalog.find(key, prefer_fp16)):
-            return p
-    return None
+def _encoder_works(name: str) -> bool:
+    """Codifica 1 quadro de teste: o encoder existir no FFmpeg não garante que a placa/driver suporte."""
+    if not _encoder_available(name):
+        return False
+    r = subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=black:s=256x256:d=0.1",
+                        "-frames:v", "1", "-c:v", name, "-f", "null", "-"], capture_output=True,
+                       creationflags=paths.no_window_flags(), timeout=60)
+    return r.returncode == 0
 
 
-def build_sr_stage(requested: str | None, scale: int, plan):
+def pick_encoder(hw, plan) -> str:
+    """Encoder de vídeo da própria placa (NVENC/AMF/QSV) quando funciona; senão libx264 na CPU."""
+    gpu = next((g for g in hw.gpus if g.name == plan.gpu_name), None)
+    order: list[str] = []
+    if gpu is not None:
+        order = {"nvidia": ["hevc_nvenc", "h264_nvenc"], "amd": ["hevc_amf", "h264_amf"],
+                 "intel": ["hevc_qsv", "h264_qsv"]}.get(gpu.vendor.value, [])
+    for name in order:
+        if _encoder_works(name):
+            return name
+    return "libx264"
+
+
+def _prefer_fp16(plan) -> bool:
+    # FP16 só em GPU (na CPU é mais lento e pode nem ter kernel)
+    return plan.backend != Backend.CPU and plan.precision != "fp32"
+
+
+def model_file(key_or_path: str, plan) -> Path:
+    """Arquivo ONNX de um modelo do catálogo (FP16 na GPU, FP32 na CPU) ou um caminho .onnx."""
+    prefer = _prefer_fp16(plan)
+    p = catalog.find(key_or_path, prefer)
+    if p and not prefer and ".fp16" in p.name:
+        p = OnnxUpscale.fp32_sibling(p) or p
+    if p is None:
+        raise FileNotFoundError(f"modelo não encontrado: {key_or_path} "
+                                f"(instale com: python -m engine models install {key_or_path})")
+    return p
+
+
+def installed_models(plan) -> set[str]:
+    return {k for k in catalog.CATALOG if catalog.find(k, _prefer_fp16(plan))}
+
+
+def plan_job(args, plan, info, path: str | None):
+    """Resolução de trabalho + modelo para este vídeo (veja engine/core/adapt.py)."""
+    from .core.adapt import choose_job
+    requested = getattr(args, "model", None)
+    custom = requested if requested and requested.endswith(".onnx") else None
+    key = None if custom else requested
+    job = choose_job(plan, info.width, info.height, args.scale, path=path, duration=info.duration,
+                     work=getattr(args, "work", "auto"), model=key, available=installed_models(plan))
+    return job, custom
+
+
+def make_sr_stage(job, plan, custom: str | None = None, tile: int | None = None):
     log = logging.getLogger("restaura")
-    path = resolve_model(requested, plan)
-    if path is None:
+    if job.sr_scale <= 1:
+        return None
+    if job.model is None and not custom:
         if plan.sr_model == "classico":
             log.warning("sem GPU acelerada: usando filtros clássicos. IA na CPU é muito lenta, mas dá "
                         "para forçar em trechos curtos com --model realesr_general_x4v3")
         else:
             log.warning("nenhum modelo de IA instalado: usando redimensionamento clássico. "
                         "Instale com: python -m engine models install realesr_general_x4v3")
-        return ResizeUpscale(scale)
-    return OnnxUpscale(path, scale, plan.backend, tile=plan.tile_size, device_id=plan.device_id)
+        return ResizeUpscale(job.sr_scale)
+    path = Path(custom) if custom else model_file(job.model, plan)
+    return OnnxUpscale(path, job.sr_scale, plan.backend, tile=tile, device_id=plan.device_id,
+                       mem_budget_mb=plan.mem_budget_mb, mem_limit_mb=plan.mem_limit_mb,
+                       max_batch=plan.batch_size)
+
+
+def build_sr_stage(requested: str | None, scale: int, plan, width: int = 720, height: int = 480):
+    """Atalho (bench sintético, selftest): mesmo critério do run, sem medir detalhe."""
+    from .core.adapt import choose_job
+    custom = requested if requested and requested.endswith(".onnx") else None
+    job = choose_job(plan, width, height, scale, work="original", model=None if custom else requested,
+                     available=installed_models(plan))
+    return make_sr_stage(job, plan, custom) or ResizeUpscale(scale)
 
 
 def cmd_models(args) -> int:
@@ -150,8 +192,11 @@ def cmd_run(args) -> int:
     info = probe(args.input)
     deint = deinterlace_choice(args.deinterlace)
     deinterlacing = deint if deint is not None else info.interlaced
+    job, custom = plan_job(args, plan, info, args.input)
+    for n in job.notes:
+        log.info("%s", n)
     stages = []
-    sr = build_sr_stage(args.model, args.scale, plan) if args.scale > 1 else None
+    sr = make_sr_stage(job, plan, custom, args.tile)
     if sr:
         stages.append(sr)
     field_rate = False
@@ -162,12 +207,15 @@ def cmd_run(args) -> int:
 
     encoder = args.encoder
     if encoder == "auto":
-        encoder = "hevc_nvenc" if plan.nvenc and _encoder_available("hevc_nvenc") else "libx264"
+        encoder = pick_encoder(hw, plan)
 
     if args.json:
         print(json.dumps({"event": "start", "gpu": plan.gpu_name, "preset": plan.preset.value,
                           "backend": plan.backend.value, "stages": [st.name for st in stages],
-                          "field_rate": field_rate, "encoder": encoder}, ensure_ascii=False), flush=True)
+                          "field_rate": field_rate, "encoder": encoder, "model": job.model,
+                          "work": f"{job.work_w}x{job.work_h}", "output": f"{job.out_w}x{job.out_h}",
+                          "provider": getattr(sr, "provider", None), "notes": job.notes},
+                         ensure_ascii=False), flush=True)
 
     def progress(done, total, fps):
         eta = (total - done) / fps if fps > 0 and total else None
@@ -183,6 +231,8 @@ def cmd_run(args) -> int:
         input=Path(args.input), output=Path(args.output), stages=stages,
         batch_size=plan.batch_size, deinterlace=deint, field_rate=field_rate,
         pre_filters=denoise_filter(denoise, plan),
+        work_size=(job.work_w, job.work_h) if job.work_div > 1 else None,
+        hwaccel="cuda" if plan.backend in (Backend.CUDA, Backend.TENSORRT) else None,
         encoder=encoder, crf=args.crf, progress=progress)
     out = Pipeline(cfg).run()
     if args.json:
@@ -208,6 +258,7 @@ def cmd_preview(args) -> int:
     """Processa um único quadro e grava antes/depois em PNG (mesmo tamanho, proporção de tela correta)."""
     import time
 
+    import numpy as np
     from PIL import Image
 
     require_ffmpeg()
@@ -217,19 +268,24 @@ def cmd_preview(args) -> int:
     deint = deinterlace_choice(args.deinterlace)
     filters = (["bwdif=mode=0"] if (deint if deint is not None else info.interlaced) else [])
     filters += denoise_filter(args.denoise, plan)
+    job, custom = plan_job(args, plan, info, args.input)
     original = _grab_frame(args.input, t, [], info.width, info.height)
-    frame = _grab_frame(args.input, t, filters, info.width, info.height)
+    if job.work_div > 1:
+        filters.append(f"scale={job.work_w}:{job.work_h}:flags=lanczos")
+    frame = _grab_frame(args.input, t, filters, job.work_w, job.work_h)
 
-    st = build_sr_stage(args.model, args.scale, plan) if args.scale > 1 else None
+    st = make_sr_stage(job, plan, custom, args.tile)
     seconds = 0.0
     if st:
-        st.setup(info.width, info.height)
-        st.process(frame[None])                        # aquecimento (compilação de kernels)
+        st.setup(job.work_w, job.work_h)
+        batch = np.repeat(frame[None], max(1, plan.batch_size), axis=0)
+        st.process(batch)                              # aquecimento (escolha de kernels do cuDNN)
         t0 = time.perf_counter()
-        after = st.process(frame[None])[0]
-        seconds = time.perf_counter() - t0
+        after = st.process(batch)[0]
+        seconds = (time.perf_counter() - t0) / len(batch)
     else:
-        after = frame
+        from .stages.upscale import _resize
+        after = _resize(frame, job.out_w, job.out_h)
     oh = after.shape[0]
     ow = round(oh * float(info.dar)) if info.dar else after.shape[1]
     out_dir = Path(args.out)
@@ -244,7 +300,9 @@ def cmd_preview(args) -> int:
               "estimated_seconds": round(seconds * frames) if seconds else None,
               "model": getattr(st, "model_path", None) and st.model_path.name,
               "provider": st.session.get_providers()[0] if isinstance(st, OnnxUpscale) else None,
-              "gpu": plan.gpu_name, "preset": plan.preset.value}
+              "gpu": plan.gpu_name, "preset": plan.preset.value,
+              "work": f"{job.work_w}x{job.work_h}", "output": f"{job.out_w}x{job.out_h}",
+              "notes": job.notes}
     print(json.dumps(result, ensure_ascii=False), flush=True)
     return 0
 
@@ -317,38 +375,58 @@ def cmd_bench(args) -> int:
     import numpy as np
 
     hw, plan = make_plan(args)
-    st = build_sr_stage(args.model, args.scale, plan)
+    if args.input:
+        require_ffmpeg()
+        info = probe(args.input)
+        job, custom = plan_job(args, plan, info, args.input)
+        filt = [f"scale={job.work_w}:{job.work_h}:flags=lanczos"] if job.work_div > 1 else []
+        src = _grab_frame(args.input, max(0.0, info.duration * 0.4), filt, job.work_w, job.work_h)
+        frames_total = info.frames
+    else:
+        from .core.adapt import choose_job
+        w, h = (int(v) for v in args.size.lower().split("x"))
+        custom = args.model if args.model and args.model.endswith(".onnx") else None
+        job = choose_job(plan, w, h, args.scale, work=args.work if args.work != "auto" else "original",
+                         model=None if custom else args.model, available=installed_models(plan))
+        rng = np.random.default_rng(0)
+        yy, xx = np.mgrid[0:job.work_h, 0:job.work_w]
+        src = np.stack([(xx * 255 // job.work_w), (yy * 255 // job.work_h), ((xx + yy) % 256)], -1)
+        src = np.clip(src + rng.integers(-20, 20, src.shape), 0, 255).astype(np.uint8)
+        frames_total = round(3600 * 29.97)
+    st = make_sr_stage(job, plan, custom, args.tile) or ResizeUpscale(max(1, job.sr_scale))
     if isinstance(st, OnnxUpscale):
-        label = f"{st.model_path.name} via {st.session.get_providers()[0]} ({st.dtype.__name__})"
+        label = f"{st.model_path.name} via {st.provider} ({st.dtype.__name__})"
     else:
         label = "redimensionamento clássico (sem modelo)"
 
-    rng = np.random.default_rng(0)
-    yy, xx = np.mgrid[0:480, 0:720]
-    base = np.stack([(xx * 255 // 720), (yy * 255 // 480), ((xx + yy) % 256)], -1).astype(np.uint8)
-    frames = [np.clip(base.astype(np.int16) + rng.integers(-20, 20, base.shape), 0, 255).astype(np.uint8)
-              for _ in range(4)]
-
-    st.process(frames[0][None])  # aquecimento (TensorRT/DirectML compilam aqui)
+    batch = np.repeat(src[None], max(1, plan.batch_size), axis=0)
+    st.setup(job.work_w, job.work_h)
+    st.process(batch)  # aquecimento (cuDNN/TensorRT/DirectML escolhem e compilam kernels aqui)
     n, t0 = 0, time.perf_counter()
     while time.perf_counter() - t0 < args.seconds:
-        st.process(frames[n % 4][None]); n += 1
+        st.process(batch); n += len(batch)
     fps = n / (time.perf_counter() - t0)
-    hours = 3600 * 29.97 / fps / 3600
+    hours = frames_total / fps / 3600
 
+    layout = "inteiro" if getattr(st, "tiles", None) is None else f"{len(st.tiles)} blocos"
     result = {
         "gpu": plan.gpu_name or "CPU", "preset": plan.preset.value, "backend": plan.backend.value,
-        "estagio": label, "tile": plan.tile_size, "escala": args.scale,
-        "fps": round(fps, 2), "horas_por_hora_de_fita": round(hours, 2),
+        "estagio": label, "escala": args.scale, "entrada_ia": f"{job.work_w}x{job.work_h}",
+        "saida": f"{job.out_w}x{job.out_h}", "lote": getattr(st, "per_run", 1), "quadro": layout,
+        "fps": round(fps, 2), "horas": round(hours, 2), "notas": job.notes,
     }
     if args.json:
         print(json.dumps(result, ensure_ascii=False))
     else:
-        print(f"GPU:      {result['gpu']}")
-        print(f"Preset:   {plan.preset.value} ({plan.backend.value}, tile {plan.tile_size})")
-        print(f"Estágio:  {label}, {args.scale}x")
-        print(f"Medido:   {fps:.2f} frames/s em 720x480 ({n} frames)")
-        print(f"Estimativa: 1 h de fita (29,97 fps) leva ~{_fmt_hours(hours)}")
+        alvo = Path(args.input).name if args.input else "1 h de vídeo a 29,97 fps"
+        print(f"GPU:        {result['gpu']}  ({plan.preset.value}, {plan.backend.value})")
+        print(f"Modelo:     {label}")
+        print(f"IA:         {job.work_w}x{job.work_h} -> {job.out_w}x{job.out_h}  "
+              f"(quadro {layout}, {result['lote']} por chamada)")
+        for nota in job.notes:
+            print(f"            {nota}")
+        print(f"Medido:     {fps:.2f} quadros/s ({n} quadros)")
+        print(f"Estimativa: {alvo} leva ~{_fmt_hours(hours)} só na IA")
     return 0
 
 
@@ -374,6 +452,8 @@ def main(argv=None) -> int:
                    help="60 fps: em vídeo entrelaçado usa 1 quadro por campo (movimento real); senão interpola")
     r.add_argument("--deinterlace", choices=["auto", "on", "off"], default="auto")
     r.add_argument("--denoise", choices=["auto", *DENOISE_LEVELS], default="auto")
+    r.add_argument("--work", choices=["auto", "original", "half"], default="auto",
+                   help="resolução em que a IA roda: auto mede o detalhe real do vídeo")
     r.add_argument("--no-denoise", action="store_true", help="o mesmo que --denoise off")
     r.add_argument("--encoder", default="auto")
     r.add_argument("--crf", type=int, default=18)
@@ -395,6 +475,9 @@ def main(argv=None) -> int:
     b.add_argument("--preset", choices=[x.value for x in Preset])
     b.add_argument("--tile", type=int)
     b.add_argument("--seconds", type=float, default=15)
+    b.add_argument("--input", help="usa um vídeo real (resolução, detalhe e duração dele)")
+    b.add_argument("--size", default="720x480", help="sem --input: resolução sintética (padrão 720x480)")
+    b.add_argument("--work", choices=["auto", "original", "half"], default="auto")
     b.add_argument("--json", action="store_true")
     b.add_argument("--gpu", type=int, help="índice da GPU (veja 'detect') para montar o plano")
     b.add_argument("--device", type=int,
@@ -411,6 +494,7 @@ def main(argv=None) -> int:
     pv.add_argument("--tile", type=int)
     pv.add_argument("--deinterlace", choices=["auto", "on", "off"], default="auto")
     pv.add_argument("--denoise", choices=["auto", *DENOISE_LEVELS], default="auto")
+    pv.add_argument("--work", choices=["auto", "original", "half"], default="auto")
     pv.add_argument("--smooth", action="store_true", help="só afeta a estimativa de tempo")
     pv.add_argument("--gpu", type=int)
     pv.add_argument("--device", type=int)

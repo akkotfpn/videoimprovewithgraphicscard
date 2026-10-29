@@ -1,6 +1,6 @@
 [project]
 name = "videoimprove-engine"
-version = "0.2.0"
+version = "0.3.0"
 description = "Restauração e upscaling de vídeos antigos (VHS) com pipeline adaptativo à GPU"
 readme = "README.md"
 license = { text = "Apache-2.0" }

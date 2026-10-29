@@ -29,15 +29,19 @@ VIDEO_EXTS = {".avi", ".mp4", ".mkv", ".mov", ".mpg", ".mpeg", ".m2ts", ".mts", 
 
 PRESETS = [("auto", "Automática"), ("ultra", "Ultra"), ("equilibrado", "Equilibrada"),
            ("economico", "Econômica (PCs modestos)"), ("cpu", "Sem IA (só filtros, rápido)")]
-MODELS = [("auto", "Automático"), ("realesr_general_x4v3", "Leve e rápido"),
-          ("realesrgan_x4plus", "Detalhado (mais lento)")]
+MODELS = [("auto", "Automático (pela placa e pelo vídeo)"), ("realesr_general_x4v3", "Leve e rápido"),
+          ("realesrgan_x2plus", "Detalhado 2× (lento)"), ("realesrgan_x4plus", "Detalhado 4× (muito lento)")]
+WORK = [("auto", "Automática (mede o detalhe real)"), ("original", "Original do arquivo"),
+        ("half", "Metade (vídeo de fita salvo em HD)")]
 SCALES = [(2, "2× (recomendado para VHS)"), (4, "4×"), (1, "1× (só restaurar, sem ampliar)")]
 DENOISE = [("auto", "Automática"), ("off", "Desligada"), ("light", "Leve"), ("medium", "Média"),
            ("strong", "Forte")]
 BACKEND_NAMES = {"tensorrt": "TensorRT", "cuda": "CUDA", "directml": "DirectML", "openvino": "OpenVINO",
                  "rocm": "ROCm", "ncnn_vulkan": "Vulkan", "cpu": "CPU"}
 PRESET_NAMES = {"ultra": "Ultra", "equilibrado": "Equilibrada", "economico": "Econômica", "cpu": "Sem IA"}
-MODEL_NAMES = {"classico": "nenhum (filtros clássicos)", "realesr_general_x4v3": "Leve"}
+MODEL_NAMES = {"classico": "nenhum (filtros clássicos)"}
+MODEL_SHORT = {"realesr_general_x4v3": "Leve", "realesrgan_x2plus": "Detalhado 2×",
+               "realesrgan_x4plus": "Detalhado 4×"}
 
 
 def num(x: float, digits: int = 1) -> str:
@@ -241,6 +245,10 @@ class MainWindow(QMainWindow):
         self.cb_model = self._combo(MODELS)
         self.cb_scale = self._combo(SCALES)
         self.cb_denoise = self._combo(DENOISE)
+        self.cb_work = self._combo(WORK)
+        self.cb_work.setToolTip(
+            "Muitos vídeos de fita foram digitalizados e salvos em 1080p, mas têm detalhe de SD. "
+            "Nesses, a IA roda em meia resolução e amplia 4×: mesmo resultado, ~4× mais rápido.")
         self.chk_smooth = QCheckBox("Movimento fluido (60 fps)")
         self.chk_smooth.setToolTip(
             "Em fitas VHS (entrelaçadas), usa cada campo da imagem como um quadro: dobra a fluidez com o "
@@ -250,8 +258,9 @@ class MainWindow(QMainWindow):
         form.addRow("Modelo de IA", self.cb_model)
         form.addRow("Ampliação", self.cb_scale)
         form.addRow("Redução de ruído", self.cb_denoise)
+        form.addRow("Resolução da IA", self.cb_work)
         form.addRow("", self.chk_smooth)
-        for w in (self.cb_gpu, self.cb_preset, self.cb_model, self.cb_scale, self.cb_denoise):
+        for w in (self.cb_gpu, self.cb_preset, self.cb_model, self.cb_scale, self.cb_denoise, self.cb_work):
             w.currentIndexChanged.connect(self._settings_changed)
         self.chk_smooth.toggled.connect(self._settings_changed)
         rv.addWidget(box)
@@ -368,7 +377,7 @@ class MainWindow(QMainWindow):
     def _load_settings(self):
         s = self.settings
         for cb, key in ((self.cb_preset, "preset"), (self.cb_model, "model"), (self.cb_scale, "scale"),
-                        (self.cb_denoise, "denoise")):
+                        (self.cb_denoise, "denoise"), (self.cb_work, "work")):
             v = s.value(key)
             if v is None:
                 continue
@@ -393,6 +402,7 @@ class MainWindow(QMainWindow):
         s.setValue("model", self.cb_model.currentData())
         s.setValue("scale", self.cb_scale.currentData())
         s.setValue("denoise", self.cb_denoise.currentData())
+        s.setValue("work", self.cb_work.currentData())
         s.setValue("smooth", "true" if self.chk_smooth.isChecked() else "false")
         s.setValue("out_dir", self.ed_out.text())
         s.setValue("out_mode", "custom" if self.rb_custom.isChecked() else "same")
@@ -456,10 +466,8 @@ class MainWindow(QMainWindow):
         self.hw_chip.setToolTip("\n".join(plan.reasons))
         model = self.cb_model.currentData()
         scale = self.cb_scale.currentData()
-        if scale == 1:
-            model_txt = "nenhum (sem ampliação)"
-        elif model == "auto":
-            model_txt = MODEL_NAMES.get(plan.sr_model, "Detalhado")
+        if model == "auto":
+            model_txt = MODEL_NAMES.get(plan.sr_model, "escolhido por vídeo (veja a prévia)")
         else:
             model_txt = dict(MODELS)[model]
         warn = ""
@@ -618,7 +626,8 @@ class MainWindow(QMainWindow):
         return out
 
     def _common_args(self) -> list[str]:
-        args = ["--scale", str(self.cb_scale.currentData()), "--denoise", self.cb_denoise.currentData()]
+        args = ["--scale", str(self.cb_scale.currentData()), "--denoise", self.cb_denoise.currentData(),
+                "--work", self.cb_work.currentData()]
         if self.cb_preset.currentData() != "auto":
             args += ["--preset", self.cb_preset.currentData()]
         if self.cb_model.currentData() != "auto":
@@ -674,7 +683,11 @@ class MainWindow(QMainWindow):
         kind = ev.get("event")
         if kind == "start":
             job.extra["start"] = ev
-            self._log(f"usando {ev.get('gpu') or 'CPU'} · {ev.get('backend')} · etapas: {', '.join(ev.get('stages', []))}")
+            self._log(f"usando {ev.get('gpu') or 'CPU'} · {ev.get('provider') or ev.get('backend')} · "
+                      f"modelo {ev.get('model') or 'nenhum'} · IA em {ev.get('work')} -> {ev.get('output')}")
+            for n in ev.get("notes", []):
+                self._log(f"  {n}")
+            job.item.setToolTip(3, f"IA em {ev.get('work')} -> {ev.get('output')} · {ev.get('model') or 'sem IA'}")
         elif kind == "progress":
             total, done = ev.get("total") or 0, ev.get("done") or 0
             if total:
@@ -761,7 +774,8 @@ class MainWindow(QMainWindow):
         self.btn_clear.setEnabled(any(j.status in ("done", "cancelled", "error") for j in self.jobs))
         has_sel = bool(self._selected_jobs()) or len(self.jobs) == 1
         self.btn_preview.setEnabled(has_sel and not running and not side and self.hw is not None)
-        for w in (self.cb_gpu, self.cb_preset, self.cb_model, self.cb_scale, self.cb_denoise, self.chk_smooth,
+        for w in (self.cb_gpu, self.cb_preset, self.cb_model, self.cb_scale, self.cb_denoise, self.cb_work,
+                  self.chk_smooth,
                   self.rb_same, self.rb_custom, self.ed_out):
             w.setEnabled(not running)
 
@@ -802,7 +816,10 @@ class MainWindow(QMainWindow):
         engine = f"{r.get('gpu') or 'CPU'}"
         if r.get("provider"):
             engine += f" ({r['provider'].replace('ExecutionProvider', '')})"
-        parts = [f"Quadro em {fmt_duration(r.get('time'))} · {engine}"]
+        model = MODEL_SHORT.get((r.get("model") or "").split(".")[0], r.get("model") or "sem IA")
+        parts = [f"Quadro em {fmt_duration(r.get('time'))} · {engine} · modelo {model} · "
+                 f"IA em {r.get('work')} → {r.get('output')}"]
+        parts += [n[0].upper() + n[1:] for n in r.get("notes", [])]
         if spf:
             parts.append(f"{num(spf, 2)} s por quadro · vídeo inteiro: <b>~{fmt_duration(est)}</b> só na IA")
         dlg = PreviewDialog(r["before"], r["after"], "<br>".join(parts), self)

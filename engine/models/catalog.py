@@ -31,6 +31,9 @@ class ModelSpec:
     license: str
     sources: tuple[Source, ...]
     blend_default: float | None = None   # DNI entre as duas fontes (força do denoise)
+    scale: int = 4                       # fator nativo
+    gmac_per_px: float = 1.0             # custo: bilhões de multiplicações por pixel de ENTRADA / 1000
+    mem_per_px: int = 2000               # memória de ativação estimada (bytes/pixel de entrada, FP16)
 
 
 CATALOG: dict[str, ModelSpec] = {
@@ -42,14 +45,29 @@ CATALOG: dict[str, ModelSpec] = {
                 "8dc7edb9ac80ccdc30c3a5dca6616509367f05fbc184ad95b731f05bece96292"),
          Source(f"{_RE}/v0.2.5.0/realesr-general-wdn-x4v3.pth",
                 "1641f8c4464b9f097c9fdda5589273713f67cf59f3d909e0bd688f0cee269dca")),
-        blend_default=0.5),
+        blend_default=0.5, scale=4, gmac_per_px=1.2, mem_per_px=1200),
+    "realesrgan_x2plus": ModelSpec(
+        "realesrgan_x2plus",
+        "Real-ESRGAN x2plus (2x nativo, 16,7 M parâmetros). Mais detalhe que o compact, ~4x mais "
+        "leve que o x4plus para ampliar 2x.",
+        "BSD-3-Clause",
+        (Source(f"{_RE}/v0.2.1/RealESRGAN_x2plus.pth",
+                "49fafd45f8fd7aa8d31ab2a22d14d91b536c34494a5cfe31eb5d89c2fa266abb"),),
+        scale=2, gmac_per_px=4.5, mem_per_px=3000),
     "realesrgan_x4plus": ModelSpec(
         "realesrgan_x4plus",
-        "Real-ESRGAN x4plus (4x, 16,7 M parâmetros). Equilibrado/Ultra.",
+        "Real-ESRGAN x4plus (4x, 16,7 M parâmetros). O mais pesado; vale para material SD em 4x.",
         "BSD-3-Clause",
         (Source(f"{_RE}/v0.1.0/RealESRGAN_x4plus.pth",
-                "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1"),)),
+                "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1"),),
+        scale=4, gmac_per_px=17.9, mem_per_px=10000),
 }
+
+
+def spec_for(path: str | Path) -> ModelSpec | None:
+    """Acha o ModelSpec pelo nome do arquivo (realesrgan_x2plus.fp16.onnx -> realesrgan_x2plus)."""
+    stem = Path(path).name.split(".")[0]
+    return CATALOG.get(stem)
 
 
 def default_dir() -> Path:

@@ -14,6 +14,16 @@ Na primeira vez, o Windows pode avisar "O Windows protegeu o computador" (o prog
 
 A pré-release **dev** é atualizada a cada mudança na branch `main`.
 
+### Quanto tempo leva
+
+O custo da IA cresce com o número de pixels **de entrada**. O app escolhe o modelo e a resolução de trabalho para cada vídeo:
+
+- **Fita VHS (720×480):** roda direto. Numa RTX da série 40/50, o modelo Detalhado 2× roda na faixa de tempo real.
+- **Vídeo salvo em 1080p que veio de fita:** o app mede o detalhe real. Se a imagem não tem detalhe de HD (o caso comum de VHS digitalizado em 1080p), a IA roda em 960×540 e amplia 4×: o mesmo resultado, cerca de 4× mais rápido.
+- **HD de verdade (1080p com detalhe):** usa o modelo leve, porque os pesados levariam dezenas de horas.
+
+A prévia de um quadro mostra o modelo escolhido, a resolução em que a IA vai rodar e a estimativa de tempo do vídeo inteiro. Para medir a sua máquina com um arquivo real: `videoimprove-cli.exe bench --input "C:\caminho\video.mp4"`.
+
 ---
 
 ## Para desenvolvedores
@@ -68,7 +78,8 @@ python -m engine detect                         # o que foi detectado e qual pre
 python -m engine models install all             # baixa e converte os modelos (~75 MB, sem PyTorch)
 python -m engine bench                          # velocidade do modelo do seu preset
 python -m engine bench --model realesr_general_x4v3   # modelo leve (o dos PCs medianos)
-python -m engine bench --model realesrgan_x4plus      # modelo pesado
+python -m engine bench --model realesrgan_x2plus      # modelo pesado (2x nativo)
+python -m engine bench --input fita.mp4               # com um vídeo real (resolução e duração dele)
 ```
 
 O `bench` mostra quantos frames por segundo a sua máquina processa e estima quanto tempo leva **1 hora de fita**.

@@ -98,6 +98,8 @@ class PipelineConfig:
     batch_size: int = 4
     deinterlace: bool | None = None       # None = automático pelo ffprobe
     field_rate: bool = False              # desentrelaçar em 1 quadro por campo (29,97i -> 59,94p)
+    work_size: tuple[int, int] | None = None  # resolução entregue à IA (reduz antes, no FFmpeg)
+    hwaccel: str | None = None            # decodificação por hardware (ex.: "cuda" = NVDEC)
     pre_filters: list[str] = field(default_factory=list)  # filtros clássicos FFmpeg antes da IA
     crf: int = 18
     encoder: str = "libx264"              # h264_nvenc / hevc_nvenc / hevc_amf / hevc_qsv
@@ -128,7 +130,16 @@ class Pipeline:
             # movimento real, o jeito mais fiel de converter VHS). Ambos mantêm a sincronia do áudio.
             filters.append("bwdif=mode=1" if self.cfg.field_rate else "bwdif=mode=0")
         filters += self.cfg.pre_filters
-        cmd = ["ffmpeg", "-v", "error", "-nostdin", "-i", str(self.cfg.input)]
+        if self.cfg.work_size and self.cfg.work_size != (self.info.width, self.info.height):
+            w, h = self.cfg.work_size
+            # redução antes da IA (depois do denoise): a IA trabalha no detalhe real do vídeo
+            filters.append(f"scale={w}:{h}:flags=lanczos")
+        cmd = ["ffmpeg", "-v", "error", "-nostdin"]
+        if self.cfg.hwaccel:
+            # NVDEC/DXVA decodificam na placa; os quadros voltam para a RAM para a IA.
+            # Se o codec não for suportado, o FFmpeg cai sozinho para a decodificação por software.
+            cmd += ["-hwaccel", self.cfg.hwaccel]
+        cmd += ["-i", str(self.cfg.input)]
         if filters:
             cmd += ["-vf", ",".join(filters)]
         return cmd + ["-map", "0:v:0", "-fps_mode", "passthrough",
@@ -150,10 +161,16 @@ class Pipeline:
         if self.info.dar:
             # preserva a proporção de tela original (4:3) mesmo com pixels não quadrados na entrada
             cmd += ["-aspect", f"{self.info.dar.numerator}:{self.info.dar.denominator}"]
-        if self.cfg.encoder.endswith("nvenc"):
-            cmd += ["-preset", "p6", "-rc", "vbr", "-cq", str(self.cfg.crf)]
+        enc, q = self.cfg.encoder, str(self.cfg.crf)
+        if enc.endswith("nvenc"):
+            cmd += ["-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", q, "-b:v", "0"]
+        elif enc.endswith("amf"):
+            cmd += ["-quality", "quality", "-rc", "cqp", "-qp_i", q, "-qp_p", q]
+        elif enc.endswith("qsv"):
+            cmd += ["-preset", "slow", "-global_quality", q]
         else:
-            cmd += ["-crf", str(self.cfg.crf), "-preset", "medium"]
+            # "fast": em 4K o "medium" do x264 pode virar o gargalo quando a IA é rápida
+            cmd += ["-crf", q, "-preset", "fast"]
         # áudio: copia sem perda se o contêiner aceitar; senão AAC alta taxa
         if self.cfg.output.suffix.lower() in (".mkv", ".mov"):
             cmd += ["-c:a", "copy", "-c:s", "copy"]
@@ -186,7 +203,8 @@ class Pipeline:
                 item = q.get()
                 if item is _SENTINEL:
                     break
-                proc.stdin.write(np.ascontiguousarray(item).tobytes())
+                # memoryview: entrega o buffer ao pipe sem a cópia extra do tobytes()
+                proc.stdin.write(memoryview(np.ascontiguousarray(item)).cast("B"))
         except BaseException as e:  # noqa: BLE001
             self._errors.append(e)
             self._stop.set()
@@ -199,7 +217,7 @@ class Pipeline:
     # ---- execução ----
     def run(self) -> Path:
         info = self.info
-        w, h = info.width, info.height
+        w, h = self.cfg.work_size or (info.width, info.height)
         out_w, out_h, fps_mult = w, h, 1
         for st in self.cfg.stages:
             st.setup(out_w, out_h)

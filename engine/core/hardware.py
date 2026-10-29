@@ -475,6 +475,8 @@ class ExecutionPlan:
     reasons: list[str] = field(default_factory=list)
     gpu_name: str | None = None
     device_id: int = 0          # device_id do runtime escolhido para a GPU do plano
+    mem_budget_mb: int = 1024   # memória que a inferência pode usar por chamada (ativações)
+    mem_limit_mb: int | None = None  # teto da arena do CUDA
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, ensure_ascii=False, default=str)
@@ -568,7 +570,7 @@ def choose_plan(hw: HardwareProfile, force: Preset | None = None, gpu_index: int
         # Econômico: mesmo modelo compact do CPU, acelerado; rosto e RIFE desligados por padrão
         # (o usuário pode ligar; bwdif mode=1 já entrega 59,94 fps reais sem custo de IA)
         Preset.ECONOMICO: dict(precision="fp16" if backend != Backend.CPU else "fp32",
-                               tile=384 if vram >= 3_000 else 256, batch=1,
+                               tile=384 if vram >= 3_000 else 256, batch=2,
                                sr="realesr_general_x4v3", face=None, interp=None,
                                denoise="ffmpeg_hqdn3d"),
         # CPU: sem blocos (RAM sobra e blocos só somam sobreposição); o pipeline tem 1 frame por vez
@@ -592,9 +594,17 @@ def choose_plan(hw: HardwareProfile, force: Preset | None = None, gpu_index: int
         elif backend in (Backend.CUDA, Backend.TENSORRT) and g.cuda_index is not None:
             device_id = g.cuda_index
 
+    # orçamento de memória: ~60% da VRAM para ativações (o resto fica para pesos, cuDNN e o sistema);
+    # na CPU, 1/4 da RAM. O teto da arena impede o ONNX Runtime de ocupar a placa inteira.
+    if backend == Backend.CPU or g is None:
+        budget, limit = max(512, min(hw.ram_mb // 4, 8192)), None
+    else:
+        budget = max(256, int(vram * 0.6))
+        limit = int(vram * 0.85) if backend in (Backend.CUDA, Backend.TENSORRT) else None
+
     return ExecutionPlan(preset, backend, table["precision"], tile, table["batch"],
                          table["sr"], table["face"], table["interp"], table["denoise"],
-                         nvenc, why, g.name if g else None, device_id)
+                         nvenc, why, g.name if g else None, device_id, budget, limit)
 
 
 if __name__ == "__main__":
